@@ -1095,31 +1095,65 @@
 
     /* ── screenshots: capture + annotate ── */
 
+    let activeStream = null;
+    let activeVideo = null;
+
+    async function getPersistentTabStream() {
+      if (activeStream) {
+        const tracks = activeStream.getVideoTracks();
+        if (tracks.length && tracks[0].readyState === "live" && activeVideo && activeVideo.readyState >= 2) {
+          return { stream: activeStream, video: activeVideo, isNew: false };
+        }
+      }
+
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "browser" },
+        audio: false,
+        preferCurrentTab: true,
+        selfBrowserSurface: "include",
+        systemAudio: "exclude",
+      });
+
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      await video.play();
+
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+        track.addEventListener("ended", () => {
+          activeStream = null;
+          activeVideo = null;
+        });
+      }
+
+      activeStream = stream;
+      activeVideo = video;
+      return { stream, video, isNew: true };
+    }
+
     async function captureTab() {
       if (!navigator.mediaDevices?.getDisplayMedia) return null;
       host.style.display = "none"; // keep Pinstage itself out of the shot
       try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { displaySurface: "browser" },
-          audio: false,
-          preferCurrentTab: true,
-          selfBrowserSurface: "include",
-        });
-        const video = document.createElement("video");
-        video.srcObject = stream;
-        video.muted = true;
-        await video.play();
-        // Give the share-dialog a beat to dismiss so it isn't in the frame.
-        await new Promise((r) => setTimeout(r, 450));
-        const scale = Math.min(1, 2560 / Math.max(video.videoWidth, video.videoHeight || 1));
+        const { video, isNew } = await getPersistentTabStream();
+        if (isNew) {
+          await new Promise((r) => setTimeout(r, 450));
+        } else {
+          await new Promise((r) => setTimeout(r, 60));
+        }
+
+        const scale = Math.min(1, 2560 / Math.max(video.videoWidth || 1920, video.videoHeight || 1080));
         const c = document.createElement("canvas");
-        c.width = Math.max(1, Math.round(video.videoWidth * scale));
-        c.height = Math.max(1, Math.round(video.videoHeight * scale));
+        c.width = Math.max(1, Math.round((video.videoWidth || 1920) * scale));
+        c.height = Math.max(1, Math.round((video.videoHeight || 1080) * scale));
         c.getContext("2d").drawImage(video, 0, 0, c.width, c.height);
-        stream.getTracks().forEach((t) => t.stop());
         return c;
       } catch (e) {
         console.debug("[pinstage] capture cancelled:", e.message);
+        activeStream = null;
+        activeVideo = null;
         return null;
       } finally {
         host.style.display = "";
