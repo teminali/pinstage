@@ -33,8 +33,12 @@ Built by [Teminali](https://github.com/teminali) and used in production on
   the toolbar.
 - **Team gated**: Pinstage renders nothing unless your backend says the
   signed-in user is on the team.
+- **Technical context**: each thread records what was actually clicked - the
+  element's test id and text, the React or Vue component behind it, the
+  source file in a dev build - along with the console errors and failed
+  requests from the seconds before the pin.
 - **AI ready**: a bundled MCP server turns the queue into native tools for
-  Claude Code, Codex, or any MCP client.
+  Claude Code, Codex, or any MCP client, technical context included.
 - **GitHub Issues mirror**: threads sync one way into a repo you choose.
 
 ## Quick start
@@ -102,19 +106,37 @@ interface Adapter {
 The data shapes Pinstage writes:
 
 ```
-thread.data  = { project, path, query, anchor, preview,
+thread.data  = { project, path, query, hash, anchor, context, diagnostics,
+                 preview,
                  status: "open" | "resolved",
                  createdBy: {uid, name, email},
                  createdAt: {_ts}, lastActivityAt: {_ts}, messageCount,
-                 appVersion, viewport, userAgent, resolvedBy?, resolvedAt? }
+                 appVersion, commit, branch,
+                 viewport, dpr, scroll: {x, y}, userAgent,
+                 resolvedBy?, resolvedAt? }
+
+context      = { element: {tag, id, classes, testId, testIdAttr, text, html,
+                           data, role, ariaLabel, name, type, href, ...},
+                 framework: "react" | "vue",
+                 component, source: {file, line, column},
+                 ancestors: [{tag, id, testId, testIdAttr, component}] }
+
+diagnostics  = [ {kind: "console", level, message, t, ago}
+               | {kind: "error" | "rejection", message, at, t, ago}
+               | {kind: "net", method, url, status, ms, error, t, ago} ]
 
 comment.data = { threadId, authorUid, authorName, body,
                  mentions: [uid], attachments: [{url, w, h}],
                  createdAt: {_ts} }
 ```
 
-Timestamps are `{_ts: <epoch ms>}` objects so they serialize cleanly through
-JSON stores.
+Thread timestamps are `{_ts: <epoch ms>}` objects so they serialize cleanly
+through JSON stores. Diagnostics entries are a flat log rather than thread
+metadata, so they carry a raw epoch `t` plus `ago` in seconds.
+
+`context` and `diagnostics` are absent on threads pinned before 0.5.0, and
+`context` is `null` if the fingerprint could not be read. Every reader
+degrades to whatever the thread actually has.
 
 ## Supabase adapter reference
 
@@ -145,11 +167,86 @@ Pinstage.supabaseAdapter({
 })
 ```
 
+## Technical context
+
+The distance between "the button does nothing" and the line of code is
+usually one grep - if you know the test id, the component name, or the
+source file. Pinstage reads all three off the DOM at the moment of the
+click, and records what the page was doing at the time.
+
+| Field | What it holds |
+|---|---|
+| `context.element` | tag, id, classes, test id (`data-testid`, `data-cy`, `data-qa`, ...), `role` and `aria-label`, `name` / `type` / `href`, the visible text, the remaining `data-*`, and the element's open tag |
+| `context.component` | the React or Vue component that owns the element |
+| `context.source` | `{file, line, column}` - the JSX or SFC it was compiled from |
+| `context.ancestors` | the nearest parents carrying a test id, an id, or a component boundary |
+| `diagnostics` | console errors and warnings, uncaught exceptions, promise rejections, and failed or slow requests from the seconds before the pin |
+| `commit`, `branch` | which tree the report came from, if you pass them |
+
+Component and source come from the framework's own dev-build metadata
+(React's fiber `_debugSource`, Vue's `__file`). Production builds strip
+both, which is the point: this is staging instrumentation. Everything else -
+test ids, text, diagnostics - works in any build.
+
+The MCP server renders it into every tool result, so an agent reads this:
+
+```
+element: <SubmitButton> span.label "Place order" in button[data-testid="checkout-submit"]
+source: /src/checkout/SubmitButton.tsx:42
+diagnostics: 2 errors, 2 request issues (500 POST /api/orders), 1 warning
+```
+
+instead of fetching a screenshot to work out which button was meant.
+
+### Tuning the capture
+
+```js
+Pinstage.init({
+  // ...
+  appVersion: "1.2.3",
+  commitSha: "a1b2c3d",           // whatever your build already exposes
+  branch: "fix/checkout-total",
+
+  diagnostics: {                  // all optional; defaults shown
+    console: true,                // console.error and console.warn
+    errors:  true,                // window errors and unhandled rejections
+    network: true,                // failed requests, and successes over slowMs
+    ignore:  [],                  // ["/api/health", /\/analytics\//]
+    redact:  undefined,           // (text) => text, over every URL and message
+    limit:    30,                 // entries held in memory
+    windowMs: 60000,              // how far back a pin looks
+    max:      12,                 // entries written onto one thread
+    slowMs:   3000,               // a success this slow is still worth noting
+  },
+});
+```
+
+`diagnostics: false` turns the capture off entirely.
+
+### What leaves the page
+
+The buffer is in memory and is only ever written onto a thread a team member
+deliberately creates. Nothing is transmitted on its own.
+
+Successful requests are not recorded at all - only failures and anything
+slower than `slowMs` - so ordinary traffic never reaches your database.
+Pinstage's own requests and logging are excluded from its own report. What
+does get recorded is request URLs and error messages, which can carry query
+parameters or user data: `ignore` and `redact` are there for that, and
+`diagnostics: false` if you would rather collect none of it.
+
+Note that the buffer is installed for anyone who loads the script, before
+the team check resolves, because the errors worth catching are usually the
+ones that fire during page load. Users who are not on the roster still get
+no toolbar, no pins, and no way to send anything anywhere.
+
 ## AI agents (MCP server)
 
 `mcp/pinstage-mcp.mjs` is a zero-dependency MCP server that exposes the
 queue as tools: `pinstage_list_issues`, `pinstage_get_issue` (full thread
-with screenshot URLs), `pinstage_reply`, `pinstage_resolve`,
+with screenshot URLs and the context above), `pinstage_get_context` (the
+same context as JSON, with `searchKeys` - the strings most likely to appear
+verbatim in your source), `pinstage_reply`, `pinstage_resolve`,
 `pinstage_reopen`, and `pinstage_sync_github`.
 
 ```bash
@@ -184,9 +281,14 @@ PINSTAGE_GITHUB_REPO=owner/repo node mcp/pinstage-mcp.mjs sync-github \
   --env-file /path/to/your-app/.env.local
 ```
 
+Mirrored issues carry the element, the source file and the commit in the
+header, with the diagnostics and the full context in collapsed `<details>`
+blocks.
+
 Token resolution: `PINSTAGE_GITHUB_TOKEN`, then `GITHUB_TOKEN`, then
 `gh auth token`. Set `PINSTAGE_APP_URL` so issue bodies can deep-link back
-to the pin.
+to the pin, and `PINSTAGE_GITHUB_API` for GitHub Enterprise
+(`https://<host>/api/v3`).
 
 ## Building a dashboard on top
 
@@ -199,7 +301,15 @@ replies, resolves, and links back to the pins.
 
 - Anchors store a short CSS path (`#id` preferred, then a `tag:nth-of-type`
   chain) plus the click's relative offset inside that element, with a
-  document-position fallback when the selector no longer matches.
+  document-position fallback when the selector no longer matches. The
+  toolbar is taken out of hit testing with `display: none` for that one
+  `elementFromPoint` call: clearing `pointer-events` on the shadow host is
+  not enough, because the comment overlay sets `pointer-events: auto` and
+  `elementFromPoint` retargets shadow content back to the host.
+- The diagnostics buffer wraps `console`, `fetch` and `XMLHttpRequest` once
+  per page and holds a bounded ring in memory. Pinstage takes its own handle
+  on `fetch` before instrumenting anything, so its traffic stays out of its
+  own report.
 - Screenshot capture uses `getDisplayMedia({preferCurrentTab})`. The toolbar
   hides itself during the grab, caps output at 2560px, and exports JPEG.
 - The annotation editor is canvas based. Drawing operations are replayable

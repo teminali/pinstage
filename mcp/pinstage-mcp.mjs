@@ -2,14 +2,21 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * pinstage-mcp: an MCP server for the Pinstage issue queue
  * https://github.com/teminali/pinstage
- * v0.4.1 · MIT © Teminali
+ * v0.5.0 · MIT © Teminali
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Lets AI coding agents (Claude Code, Codex, any MCP client) work Pinstage
  * issues as native tools: list the queue, read a full thread with screenshot
- * URLs, reply, resolve, reopen, and mirror everything to GitHub Issues.
- * The loop: a teammate pins an issue on staging, the agent reads it, fixes
- * the code, replies and resolves, redeploys.
+ * URLs and technical context, reply, resolve, reopen, and mirror everything
+ * to GitHub Issues. The loop: a teammate pins an issue on staging, the agent
+ * reads it, fixes the code, replies and resolves, redeploys.
+ *
+ * Threads carry what the toolbar saw at the moment of the click - the
+ * element's test id and text, the React or Vue component, the source file in
+ * a dev build, and the console errors and failed requests from just before.
+ * That context is rendered into every tool result, and served raw as JSON by
+ * pinstage_get_context, so an agent can open the right file without
+ * downloading the screenshot.
  *
  * Zero dependencies. Speaks MCP over stdio (newline-delimited JSON-RPC).
  *
@@ -30,6 +37,8 @@
  *   PINSTAGE_GITHUB_REPO     "owner/repo" for the GitHub Issues mirror
  *   PINSTAGE_GITHUB_TOKEN    falls back to GITHUB_TOKEN, then `gh auth token`
  *   PINSTAGE_APP_URL         app origin, used for deep links in issue bodies
+ *   PINSTAGE_GITHUB_API      API base (default https://api.github.com; for
+ *                            GitHub Enterprise, https://<host>/api/v3)
  *
  * The service-role key never leaves this process; the agent only sees tool
  * results. Point the env-file at the same .env.local your app already uses.
@@ -69,6 +78,8 @@ if (!URL_BASE || !KEY) {
  * deep link back to the exact pin. */
 const GH_REPO = env.PINSTAGE_GITHUB_REPO || null;
 const APP_URL = (env.PINSTAGE_APP_URL || "").replace(/\/$/, "");
+/* GitHub Enterprise Server lives at https://<host>/api/v3. */
+const GH_API = (env.PINSTAGE_GITHUB_API || "https://api.github.com").replace(/\/$/, "");
 
 function ghToken() {
   if (env.PINSTAGE_GITHUB_TOKEN) return env.PINSTAGE_GITHUB_TOKEN;
@@ -130,25 +141,226 @@ async function patchThread(id, data) {
   });
 }
 
-function threadLine({ id, data: d }) {
-  return [
+/* ── technical context ─────────────────────────────────────────────────────
+ *  The toolbar records what was clicked (element, component, source file)
+ *  and what the page was doing at the time (console errors, failed
+ *  requests). Rendering that as flat labelled lines rather than JSON keeps
+ *  it cheap to read - for a human skimming the queue and for an agent
+ *  deciding which file to open. Threads pinned before v0.5.0 carry none of
+ *  it, so every field here is optional and simply drops out.              */
+
+const has = (v) => v !== undefined && v !== null && v !== "";
+
+const sourceRef = (s) => (s?.file ? s.file + (s.line ? ":" + s.line : "") : null);
+
+const shortUrl = (u) => {
+  try {
+    const x = new URL(u, "http://relative.invalid");
+    return x.pathname + (x.search ? "?…" : "");
+  } catch {
+    return u;
+  }
+};
+
+const testIdRef = (a) => `${a.tag ?? "*"}[${a.testIdAttr || "data-testid"}="${a.testId}"]`;
+
+/* Enough of the element to recognise it, on one line. */
+function elementRef(d) {
+  const c = d.context || {};
+  const e = c.element || {};
+  const bits = [];
+  if (c.component) bits.push(`<${c.component}>`);
+  if (e.tag) {
+    let sel = e.tag;
+    if (e.id) sel += "#" + e.id;
+    if (e.classes) sel += "." + e.classes.trim().split(/\s+/)[0];
+    if (e.testId) sel += `[${e.testIdAttr || "data-testid"}="${e.testId}"]`;
+    bits.push(sel);
+  }
+  if (e.text) bits.push(`"${e.text}"`);
+  if (!bits.length) return d.anchor?.selector || null;
+  let out = bits.join(" ");
+  /* People aim at a button and hit the label span inside it, so the test id
+   * worth grepping for is usually a level or two up. */
+  if (!e.testId) {
+    const owner = (c.ancestors ?? []).find((a) => a.testId);
+    if (owner) out += ` in ${testIdRef(owner)}`;
+  }
+  return out;
+}
+
+const isError = (r) => r.kind === "error" || r.kind === "rejection" || (r.kind === "console" && r.level === "error");
+
+/* One line saying whether it is worth reading the diagnostics at all. */
+function diagSummary(rows) {
+  const errs = rows.filter(isError).length;
+  const nets = rows.filter((r) => r.kind === "net");
+  const parts = [];
+  if (errs) parts.push(`${errs} error${errs > 1 ? "s" : ""}`);
+  if (nets.length) {
+    const worst = nets.find((n) => !n.status || n.status >= 400) || nets[0];
+    parts.push(
+      `${nets.length} request issue${nets.length > 1 ? "s" : ""}` +
+        ` (${worst.status || "failed"} ${worst.method} ${shortUrl(worst.url)})`
+    );
+  }
+  const rest = rows.length - errs - nets.length;
+  if (rest) parts.push(`${rest} warning${rest > 1 ? "s" : ""}`);
+  return parts.join(", ") || `${rows.length} entr${rows.length === 1 ? "y" : "ies"}`;
+}
+
+/* Labelled rows, aligned, with the labels an agent can scan for. */
+function contextBlock(d) {
+  const c = d.context || {};
+  const e = c.element || {};
+  const rows = [];
+  const add = (k, v) => { if (has(v)) rows.push([k, v]); };
+
+  add("page", `${d.path ?? "?"}${d.query ?? ""}${d.hash ?? ""}`);
+  add(
+    "viewport",
+    d.viewport
+      ? d.viewport +
+        (d.dpr && d.dpr !== 1 ? ` @${d.dpr}x` : "") +
+        (d.scroll?.y ? `, scrolled ${d.scroll.y}px` : "")
+      : null
+  );
+  add(
+    "build",
+    [d.appVersion ? "v" + d.appVersion : null, d.commit ? "commit " + d.commit : null, d.branch ? "branch " + d.branch : null]
+      .filter(Boolean)
+      .join(" · ") || null
+  );
+  add("element", e.tag ? e.tag + (e.id ? "#" + e.id : "") + (e.classes ? "." + e.classes.trim().split(/\s+/).join(".") : "") : null);
+  add("testId", e.testId ? `${e.testId}  (${e.testIdAttr ?? "data-testid"})` : null);
+  // surfaced on its own row, because it is the string most worth grepping
+  if (!e.testId) {
+    const owner = (c.ancestors ?? []).find((a) => a.testId);
+    add("testId", owner ? `${owner.testId}  (on the parent ${testIdRef(owner)})` : null);
+  }
+  add("text", e.text ? `"${e.text}"` : null);
+  add(
+    "aria",
+    [e.role ? "role=" + e.role : null, e.ariaLabel ? `aria-label="${e.ariaLabel}"` : null].filter(Boolean).join(" ") || null
+  );
+  add("attrs", e.data ? Object.entries(e.data).map(([k, v]) => `${k}="${v}"`).join(" ") : null);
+  add("html", e.html);
+  add("selector", d.anchor?.selector);
+  add("component", c.component ? `<${c.component}>` + (c.framework ? ` (${c.framework})` : "") : null);
+  add("source", sourceRef(c.source) ? sourceRef(c.source) + (c.source.column ? ":" + c.source.column : "") : null);
+  add(
+    "ancestors",
+    (c.ancestors ?? [])
+      .map((a) => (a.component ? `<${a.component}>` : a.tag) + (a.testId ? `[${a.testId}]` : a.id ? "#" + a.id : ""))
+      .join(" < ") || null
+  );
+  add("browser", d.userAgent);
+
+  if (!rows.length) return [];
+  const w = Math.max(...rows.map(([k]) => k.length));
+  return ["Context:", ...rows.map(([k, v]) => `  ${k.padEnd(w)}  ${v}`)];
+}
+
+/* The console and network tail from the seconds before the pin, oldest
+ * first, so it reads as the sequence that led to the complaint. */
+function diagnosticsBlock(d) {
+  const rows = d.diagnostics;
+  if (!Array.isArray(rows) || !rows.length) return [];
+  const out = [`Diagnostics (${diagSummary(rows)}, oldest first):`];
+  for (const r of rows) {
+    const ago = !has(r.ago) ? "" : r.ago === 0 ? "now" : `-${r.ago}s`;
+    const kind = r.kind === "console" ? `console.${r.level}` : r.kind;
+    let text;
+    if (r.kind === "net") {
+      text = `${r.method} ${r.url} -> ${r.error ? "failed: " + r.error : r.status}` + (has(r.ms) ? ` (${r.ms}ms)` : "");
+    } else {
+      text = r.message + (r.at ? `\n${r.at}` : "");
+    }
+    const head = `  ${ago.padStart(5)}  ${kind.padEnd(13)}  `;
+    const cont = " ".repeat(head.length);
+    const [first, ...more] = String(text).split("\n");
+    out.push(head + first, ...more.map((l) => cont + l.trim()));
+  }
+  return out;
+}
+
+/* withContext: the list view wants the element and source inline; the detail
+ * view suppresses them because the full Context block follows. */
+function threadLine({ id, data: d }, withContext = true) {
+  const lines = [
     `[${d.status}] ${id}`,
     `  ${d.project ?? "?"} ${d.path ?? "?"}${d.query ?? ""}  (v${d.appVersion ?? "?"}, ${d.viewport ?? "?"})`,
+  ];
+  if (withContext) {
+    const el = elementRef(d);
+    if (el) lines.push(`  element: ${el}`);
+    const src = sourceRef(d.context?.source);
+    if (src) lines.push(`  source: ${src}`);
+    if (Array.isArray(d.diagnostics) && d.diagnostics.length) lines.push(`  diagnostics: ${diagSummary(d.diagnostics)}`);
+  }
+  lines.push(
     `  "${d.preview ?? ""}" - ${d.createdBy?.name ?? "?"}, opened ${when(d.createdAt)}, ${d.messageCount ?? 1} comment(s)` +
-      (d.resolvedBy ? `, resolved by ${d.resolvedBy.name} ${when(d.resolvedAt)}` : ""),
-  ].join("\n");
+      (d.resolvedBy ? `, resolved by ${d.resolvedBy.name} ${when(d.resolvedAt)}` : "")
+  );
+  return lines.join("\n");
 }
 
 async function threadDetail(id) {
   const t = await getThread(id);
   const cs = await comments(id);
-  const lines = [threadLine(t), "", "Thread:"];
+  const lines = [threadLine(t, false), ""];
+  const ctx = contextBlock(t.data);
+  if (ctx.length) lines.push(...ctx, "");
+  const dg = diagnosticsBlock(t.data);
+  if (dg.length) lines.push(...dg, "");
+  lines.push("Thread:");
   for (const { data: c } of cs) {
     lines.push(`  ${when(c.createdAt)}  ${c.authorName}:`);
     lines.push("    " + String(c.body ?? "").split("\n").join("\n    "));
     for (const a of c.attachments ?? []) lines.push(`    [screenshot] ${a.url}`);
   }
   return lines.join("\n");
+}
+
+/* The same context as JSON, for an agent that would rather branch on fields
+ * than parse lines. searchKeys is the point of the whole exercise: the
+ * strings most likely to appear verbatim in the source, ordered by how
+ * specific they are, so the first grep is usually the last one.            */
+function contextPayload({ id, data: d }, screenshots) {
+  const c = d.context || {};
+  const e = c.element || {};
+  const ancestors = c.ancestors ?? [];
+  const searchKeys = [
+    e.testId,
+    ...ancestors.map((a) => a.testId),      // the aimed-at parent, usually
+    c.component,
+    ...ancestors.map((a) => a.component),
+    e.id,
+    e.ariaLabel,
+    e.name,
+    e.text,
+  ]
+    .filter((v) => has(v) && String(v).length > 1)
+    .map(String);
+
+  return {
+    id,
+    status: d.status,
+    project: d.project ?? null,
+    preview: d.preview ?? null,
+    page: { path: d.path ?? null, query: d.query || null, hash: d.hash || null, scroll: d.scroll ?? null },
+    build: { appVersion: d.appVersion ?? null, commit: d.commit ?? null, branch: d.branch ?? null },
+    client: { viewport: d.viewport ?? null, dpr: d.dpr ?? null, userAgent: d.userAgent ?? null },
+    selector: d.anchor?.selector ?? null,
+    element: e.tag ? e : null,
+    framework: c.framework ?? null,
+    component: c.component ?? null,
+    source: c.source ?? null,
+    ancestors,
+    diagnostics: d.diagnostics ?? [],
+    screenshots: screenshots ?? [],
+    searchKeys: [...new Set(searchKeys)],
+  };
 }
 
 /* ── GitHub Issues one-way mirror ──────────────────────────────────────────── */
@@ -161,7 +373,7 @@ async function threadDetail(id) {
 async function gh(pathname, init = {}) {
   const token = ghToken();
   if (!token) throw new Error("no GitHub token (PINSTAGE_GITHUB_TOKEN, GITHUB_TOKEN, or `gh auth login`)");
-  const res = await fetch("https://api.github.com" + pathname, {
+  const res = await fetch(GH_API + pathname, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -196,8 +408,12 @@ async function syncGithub(repo = GH_REPO) {
       const meta = [
         `**Page:** \`${d.path ?? "?"}${d.query ?? ""}\``,
         `**Reported by:** ${d.createdBy?.name ?? "?"} - ${when(d.createdAt)}`,
-        `**Build:** v${d.appVersion ?? "?"} · ${d.viewport ?? "?"}`,
+        `**Build:** v${d.appVersion ?? "?"}${d.commit ? " · " + d.commit : ""}${d.branch ? " · " + d.branch : ""} · ${d.viewport ?? "?"}`,
       ];
+      const elRef = elementRef(d);
+      if (elRef) meta.push(`**Element:** \`${elRef}\``);
+      const srcRef = sourceRef(d.context?.source);
+      if (srcRef) meta.push(`**Source:** \`${srcRef}\``);
       if (APP_URL) {
         const sep = d.query ? "&" : "?";
         meta.push(`**Open on the app:** ${APP_URL}${d.path ?? "/"}${d.query ?? ""}${sep}mdthread=${t.id}`);
@@ -206,6 +422,11 @@ async function syncGithub(repo = GH_REPO) {
       const first = cs[0];
       if (first?.body) body += `\n> ${String(first.body).split("\n").join("\n> ")}\n`;
       for (const a of first?.attachments ?? []) body += `\n![screenshot](${a.url})\n`;
+      // Collapsed: useful when triaging, noise when scrolling the issue.
+      const dg = diagnosticsBlock(d);
+      if (dg.length) body += `\n<details><summary>${dg[0].replace(/:$/, "")}</summary>\n\n\`\`\`\n${dg.slice(1).join("\n")}\n\`\`\`\n</details>\n`;
+      const ctx = contextBlock(d);
+      if (ctx.length) body += `\n<details><summary>Technical context</summary>\n\n\`\`\`\n${ctx.slice(1).join("\n")}\n\`\`\`\n</details>\n`;
       body += `\n---\n_Synced from [Pinstage](https://github.com/teminali/pinstage) · thread \`${t.id}\`_`;
 
       const payload = { title: `${d.preview || "Pinstage issue"} (${d.path ?? "?"})`, body };
@@ -252,7 +473,7 @@ const TOOLS = [
   {
     name: "pinstage_list_issues",
     description:
-      "List Pinstage issue threads (comments pinned on the app by the team). Returns id, status, project, page path, preview, author, activity. Default: open issues only.",
+      "List Pinstage issue threads (comments pinned on the app by the team). Returns id, status, project, page path, the element and source file the pin sits on, a diagnostics summary, preview, author, and activity. Default: open issues only.",
     inputSchema: {
       type: "object",
       properties: {
@@ -266,19 +487,35 @@ const TOOLS = [
       if (project) q += `&data->>project=eq.${encodeURIComponent(project)}`;
       const rows = (await rest(q)).sort((a, b) => activity(b.data) - activity(a.data));
       if (!rows.length) return `No ${status === "all" ? "" : status + " "}issues.`;
-      return rows.map(threadLine).join("\n\n") + "\n\nUse pinstage_get_issue for the full thread.";
+      // not rows.map(threadLine): map would pass the index as withContext
+      return rows.map((r) => threadLine(r)).join("\n\n") + "\n\nUse pinstage_get_context or pinstage_get_issue for the full thread.";
     },
   },
   {
     name: "pinstage_get_issue",
     description:
-      "Read one Pinstage issue thread in full: metadata, every comment, and screenshot URLs (fetch a screenshot URL to view it).",
+      "Read one Pinstage issue thread in full: every comment, screenshot URLs (fetch one to view it), the technical context of the click (element, test id, text, component, source file in a dev build, CSS selector, build and browser), and the console errors and failed requests from just before the pin. Usually enough to find the code without opening the screenshot.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string", description: "Thread id" } },
       required: ["id"],
     },
     handler: async ({ id }) => threadDetail(id),
+  },
+  {
+    name: "pinstage_get_context",
+    description:
+      "The technical context of one Pinstage issue as JSON: clicked element (tag, id, classes, test id, text, attributes, outer tag), React/Vue component and source file, ancestor trail, CSS selector, page and build info, the console/network diagnostics captured at pin time, screenshot URLs, and searchKeys - the strings most likely to appear verbatim in the source. Use this to locate the code before reading any files.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string", description: "Thread id" } },
+      required: ["id"],
+    },
+    handler: async ({ id }) => {
+      const t = await getThread(id);
+      const shots = (await comments(id)).flatMap((c) => (c.data.attachments ?? []).map((a) => a.url));
+      return JSON.stringify(contextPayload(t, shots), null, 2);
+    },
   },
   {
     name: "pinstage_reply",
@@ -394,7 +631,7 @@ rl.on("line", async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "pinstage-mcp", version: "0.4.1" },
+        serverInfo: { name: "pinstage-mcp", version: "0.5.0" },
       });
     } else if (method === "notifications/initialized" || method?.startsWith("notifications/")) {
       // notifications need no response

@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * Pinstage: pin comments on your staging environment
  * https://github.com/teminali/pinstage
- * v0.4.1 · MIT © Teminali
+ * v0.5.0 · MIT © Teminali
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * A Figma-style comment layer for your own product. Team members click
@@ -48,6 +48,15 @@
  * security with the user's own token. Pinstage is UI, not a security
  * boundary.
  *
+ * TECHNICAL CONTEXT
+ *   Every thread carries what a human would otherwise have to be asked for:
+ *   the clicked element's test id, classes and text, the React or Vue
+ *   component behind it, the source file in a dev build, and the console
+ *   errors and failed requests from the seconds before the pin. An agent
+ *   reading the issue through mcp/pinstage-mcp.mjs lands on the right file
+ *   without opening the screenshot. See `diagnostics` in init() to tune or
+ *   disable the capture.
+ *
  * Zero dependencies. One file, no build step. UI lives in a shadow root so
  * host CSS and toolbar CSS cannot touch each other. Icons are inline SVG.
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -55,6 +64,10 @@
   "use strict";
 
   if (window.Pinstage) return; // idempotent under double-injection
+
+  /* Handles taken before the diagnostics buffer instruments anything, so
+   * Pinstage's own requests never show up in the traffic it collects. */
+  const nativeFetch = typeof window.fetch === "function" ? window.fetch.bind(window) : null;
 
   /* ── tiny utilities ─────────────────────────────────────────────────────── */
 
@@ -155,6 +168,329 @@
   }
 
   /* ═══════════════════════════════════════════════════════════════════════ */
+  /* Diagnostics ring buffer                                                  */
+  /* ═══════════════════════════════════════════════════════════════════════ */
+  /* Console errors, uncaught exceptions and failed requests, kept in memory
+   * only. Creating a pin snapshots the entries from the seconds before the
+   * click onto the thread, so whoever picks the issue up - a teammate or an
+   * agent - gets the stack trace and the 500 that came with the complaint
+   * instead of just the prose.
+   *
+   * Nothing is transmitted on its own: the buffer leaves the page only on a
+   * thread a team member deliberately creates. Hosts narrow or disable it
+   * with init({ diagnostics: … }); see install() for the options.           */
+
+  const diag = (function () {
+    const buf = [];
+    let opts = null;
+
+    const push = (e) => {
+      if (!opts) return;
+      e.t = Date.now();
+      buf.push(e);
+      if (buf.length > opts.limit) buf.shift();
+    };
+
+    const clip = (v, n) => {
+      const str = String(v ?? "");
+      return str.length > n ? str.slice(0, n) + "…" : str;
+    };
+
+    /* console.error(anything) - Errors and objects flattened to one readable
+     * line, because that is what ends up in front of the reader. */
+    const flatten = (a) => {
+      if (a instanceof Error) return a.stack || a.name + ": " + a.message;
+      if (typeof a === "string") return a;
+      try { return clip(JSON.stringify(a), 300); } catch { return String(a); }
+    };
+
+    const ignored = (url) =>
+      opts.ignore.some((p) => (p instanceof RegExp ? p.test(url) : String(url).includes(p)));
+
+    const scrub = (v) => {
+      const str = String(v ?? "");
+      if (typeof opts.redact !== "function") return str;
+      try { return String(opts.redact(str) ?? ""); } catch { return str; }
+    };
+
+    /* Only failures and stalls earn their tokens: a wall of 200s tells a
+     * reader nothing the code does not already say. */
+    function recordRequest(method, url, status, ms, err) {
+      if (!url || ignored(url)) return;
+      if (!err && status >= 200 && status < 400 && ms < opts.slowMs) return;
+      push({
+        kind: "net",
+        method,
+        url: clip(scrub(url), 300),
+        status: err ? 0 : status,
+        ms: Math.round(ms),
+        error: err ? clip(err.message || err, 200) : undefined,
+      });
+    }
+
+    function installNetwork() {
+      if (typeof window.fetch === "function") {
+        const orig = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+          const started = Date.now();
+          const url = typeof input === "string" ? input : input?.url ?? String(input);
+          const method = String(init?.method || input?.method || "GET").toUpperCase();
+          return orig(input, init).then(
+            (res) => { recordRequest(method, url, res.status, Date.now() - started); return res; },
+            (err) => { recordRequest(method, url, 0, Date.now() - started, err); throw err; }
+          );
+        };
+      }
+
+      const XHR = window.XMLHttpRequest;
+      if (!XHR) return;
+      const open = XHR.prototype.open;
+      const send = XHR.prototype.send;
+      XHR.prototype.open = function (method, url) {
+        this.__pinstage = { method: String(method || "GET").toUpperCase(), url: String(url) };
+        return open.apply(this, arguments);
+      };
+      XHR.prototype.send = function () {
+        const req = this.__pinstage;
+        if (req) {
+          req.started = Date.now();
+          this.addEventListener("loadend", () => {
+            // status 0 after loadend means the request never landed
+            recordRequest(req.method, req.url, this.status, Date.now() - req.started,
+              this.status ? null : new Error("request failed"));
+          });
+        }
+        return send.apply(this, arguments);
+      };
+    }
+
+    /* Options, all optional:
+     *   console  false to skip console.error / console.warn
+     *   errors   false to skip window errors and promise rejections
+     *   network  false to skip failed and slow requests
+     *   ignore   [string | RegExp] request URLs never to record
+     *   redact   (text) => text, run over every URL and message
+     *   limit    entries held in memory (default 30)
+     *   windowMs how far back a pin looks (default 60000)
+     *   max      entries written onto one thread (default 12)
+     *   slowMs   a successful request this slow is still worth noting (3000) */
+    function install(o) {
+      if (opts) return; // once per page
+      opts = {
+        console: o.console !== false,
+        errors: o.errors !== false,
+        network: o.network !== false,
+        ignore: o.ignore || [],
+        redact: o.redact,
+        limit: o.limit || 30,
+        windowMs: o.windowMs || 60000,
+        max: o.max || 12,
+        slowMs: o.slowMs || 3000,
+      };
+
+      if (opts.console) {
+        for (const level of ["error", "warn"]) {
+          const orig = console[level];
+          console[level] = function () {
+            try {
+              const msg = Array.from(arguments).map(flatten).join(" ");
+              // Pinstage's own logging is noise in Pinstage's own report
+              if (!msg.startsWith("[pinstage]")) push({ kind: "console", level, message: clip(scrub(msg), 600) });
+            } catch { /* never break the host's logging */ }
+            return orig.apply(console, arguments);
+          };
+        }
+      }
+
+      if (opts.errors) {
+        window.addEventListener("error", (ev) => {
+          if (!ev.error && !ev.message) return;
+          push({
+            kind: "error",
+            message: clip(scrub(ev.error?.stack || ev.message), 800),
+            at: ev.filename ? scrub(ev.filename) + ":" + ev.lineno + ":" + ev.colno : undefined,
+          });
+        }, true);
+        window.addEventListener("unhandledrejection", (ev) => {
+          const r = ev.reason;
+          push({ kind: "rejection", message: clip(scrub(r?.stack || r?.message || r), 800) });
+        });
+      }
+
+      if (opts.network) installNetwork();
+    }
+
+    /* What the pin carries: the tail of the buffer, inside the time window.
+     * Entries keep a raw epoch `t` plus `ago` seconds, so a reader does not
+     * have to do arithmetic to see the order of events. */
+    function snapshot() {
+      if (!opts) return null;
+      const from = Date.now() - opts.windowMs;
+      const rows = buf.filter((e) => e.t >= from).slice(-opts.max);
+      if (!rows.length) return null;
+      return rows.map((e) => ({ ...e, ago: Math.round((Date.now() - e.t) / 1000) }));
+    }
+
+    return { install, snapshot, buffer: buf };
+  })();
+
+  /* ═══════════════════════════════════════════════════════════════════════ */
+  /* Element fingerprint                                                      */
+  /* ═══════════════════════════════════════════════════════════════════════ */
+  /* The distance between "the button does nothing" and the line of code is
+   * usually one grep - if you know the test id, the component name, or the
+   * source file. All three are readable from the DOM at click time, and the
+   * last two only in a dev build, which is exactly where Pinstage runs.     */
+
+  const TEST_ID_ATTRS = ["data-testid", "data-test-id", "data-test", "data-cy", "data-qa", "data-pw"];
+
+  const oneLine = (v, n) => {
+    const str = String(v ?? "").replace(/\s+/g, " ").trim();
+    return str.length > n ? str.slice(0, n) + "…" : str;
+  };
+
+  const testIdOf = (el) => {
+    for (const a of TEST_ID_ATTRS) {
+      const v = el.getAttribute(a);
+      if (v) return { value: v, attr: a };
+    }
+    return null;
+  };
+
+  /* React puts the fiber on the node as an own property whose key carries a
+   * random suffix (`__reactFiber$k3l…`), so it has to be found by prefix. */
+  function reactFiber(el) {
+    const k = Object.keys(el).find((k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+    return k ? el[k] : null;
+  }
+
+  const fiberName = (t) =>
+    typeof t === "function" ? t.displayName || t.name || null
+      : t && typeof t === "object" ? t.displayName || t.render?.displayName || t.render?.name || null
+      : null;
+
+  /* Dev builds hang the JSX origin on the fiber as _debugSource (React 18 and
+   * earlier) - the single most useful field here, and absent in production
+   * builds by design. Walk up: the clicked <button> is a host fiber, its
+   * component is a few `return`s above it. */
+  function reactInfo(el) {
+    let f = reactFiber(el);
+    if (!f) return null;
+    const out = {};
+    for (let i = 0; f && i < 12; f = f.return, i++) {
+      const src = f._debugSource || f._debugOwner?._debugSource;
+      if (src && !out.source) out.source = { file: src.fileName, line: src.lineNumber, column: src.columnNumber };
+      if (!out.component) out.component = fiberName(f.type);
+      if (out.source && out.component) break;
+    }
+    return out.component || out.source ? { framework: "react", ...out } : null;
+  }
+
+  function vueInfo(el) {
+    const c3 = el.__vueParentComponent; // Vue 3
+    if (c3?.type) {
+      const t = c3.type;
+      const name = t.name || t.__name || null;
+      if (name || t.__file) return { framework: "vue", component: name, source: t.__file ? { file: t.__file } : undefined };
+    }
+    const c2 = el.__vue__; // Vue 2
+    if (c2?.$options) {
+      const o = c2.$options;
+      if (o.name || o.__file) return { framework: "vue", component: o.name || null, source: o.__file ? { file: o.__file } : undefined };
+    }
+    return null;
+  }
+
+  /* The clicked node is often a bare <span> inside the component that owns
+   * it, so look a few levels up before giving up. */
+  function frameworkInfo(el) {
+    for (let node = el, i = 0; node && i < 6; node = node.parentElement, i++) {
+      const info = reactInfo(node) || vueInfo(node);
+      if (info) return info;
+    }
+    return null;
+  }
+
+  const componentOf = (node) => {
+    const f = reactFiber(node);
+    if (f) {
+      for (let x = f, i = 0; x && i < 3; x = x.return, i++) {
+        const n = fiberName(x.type);
+        if (n) return n;
+      }
+    }
+    return vueInfo(node)?.component || null;
+  };
+
+  function describeElement(el) {
+    if (!(el instanceof Element)) return null;
+    const d = { tag: el.tagName.toLowerCase() };
+    if (el.id) d.id = el.id;
+
+    const cls = el.getAttribute("class");
+    if (cls) d.classes = oneLine(cls, 200);
+
+    const tid = testIdOf(el);
+    if (tid) { d.testId = tid.value; d.testIdAttr = tid.attr; }
+
+    const data = {};
+    for (const { name, value } of Array.from(el.attributes)) {
+      if (!name.startsWith("data-") || TEST_ID_ATTRS.includes(name)) continue;
+      if (Object.keys(data).length >= 8) break;
+      data[name] = oneLine(value, 60);
+    }
+    if (Object.keys(data).length) d.data = data;
+
+    for (const a of ["role", "aria-label", "name", "type", "href", "placeholder", "alt", "title", "disabled"]) {
+      const v = el.getAttribute(a);
+      if (v !== null) d[a === "aria-label" ? "ariaLabel" : a] = oneLine(v, 120) || true;
+    }
+
+    const text = oneLine(el.textContent, 80);
+    if (text) d.text = text;
+
+    // cloneNode(false): the open tag only, so a click on a big container
+    // does not serialize its whole subtree just to be truncated
+    d.html = oneLine(el.cloneNode(false).outerHTML, 300);
+    return d;
+  }
+
+  /* Only the ancestors that mean something to a reader - a test id, an id,
+   * or a component boundary. Layout wrappers are skipped. */
+  function ancestorTrail(el) {
+    const out = [];
+    let node = el.parentElement;
+    for (let i = 0; node && node !== document.body && i < 12 && out.length < 4; node = node.parentElement, i++) {
+      const tid = testIdOf(node);
+      const component = componentOf(node);
+      if (!tid && !node.id && !component) continue;
+      out.push({
+        tag: node.tagName.toLowerCase(),
+        id: node.id || undefined,
+        testId: tid?.value,
+        testIdAttr: tid?.attr,
+        component: component || undefined,
+      });
+    }
+    return out;
+  }
+
+  /* The whole technical context of one click, in the shape the MCP server
+   * and the GitHub mirror read back. */
+  function contextFromElement(el) {
+    const ctx = { element: describeElement(el) };
+    const fw = frameworkInfo(el);
+    if (fw) {
+      ctx.framework = fw.framework;
+      if (fw.component) ctx.component = fw.component;
+      if (fw.source) ctx.source = fw.source;
+    }
+    const trail = ancestorTrail(el);
+    if (trail.length) ctx.ancestors = trail;
+    return ctx;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════ */
   /* Built-in Supabase adapter (PostgREST + RLS + Storage)                    */
   /* ═══════════════════════════════════════════════════════════════════════ */
 
@@ -188,7 +524,7 @@
     async function rest(path, init_) {
       const token = await opts.getToken();
       if (!token) throw new Error("no session");
-      const res = await fetch(opts.url.replace(/\/$/, "") + "/rest/v1/" + path, {
+      const res = await (nativeFetch || fetch)(opts.url.replace(/\/$/, "") + "/rest/v1/" + path, {
         ...(init_ || {}),
         headers: {
           apikey: opts.anonKey,
@@ -318,7 +654,7 @@
         const ext = (blob.type.split("/")[1] || "jpg").replace("jpeg", "jpg");
         const path = prefix + "/" + ((meta && meta.threadId) || "misc") + "/" + uuid() + "." + ext;
         const base = opts.url.replace(/\/$/, "");
-        const res = await fetch(base + "/storage/v1/object/" + bucket + "/" + path, {
+        const res = await (nativeFetch || fetch)(base + "/storage/v1/object/" + bucket + "/" + path, {
           method: "POST",
           headers: { apikey: opts.anonKey, Authorization: "Bearer " + token, "Content-Type": blob.type },
           body: blob,
@@ -350,6 +686,11 @@
     const adapter = cfg.adapter;
     const project = cfg.project || "unknown";
     const canAttach = typeof adapter.uploadAttachment === "function";
+
+    /* Installed before identity resolves, because the errors worth catching
+     * are usually the ones that fire during page load. In memory only until
+     * a team member pins a thread; `diagnostics: false` opts out entirely. */
+    if (cfg.diagnostics !== false) diag.install(cfg.diagnostics || {});
 
     /* Production-friendly quiet mode: with startHidden true the toolbar
      * boots as the small dot and pins stay off the page until the user
@@ -411,7 +752,7 @@
       return out;
     }
 
-    async function createThread(anchor, body, mentions, atts) {
+    async function createThread(anchor, context, body, mentions, atts) {
       const threadId = uuid();
       const thread = {
         id: threadId,
@@ -419,7 +760,10 @@
           project,
           path: state.pathname,
           query: location.search || "",
+          hash: location.hash || "",
           anchor,
+          context,                                  // element, component, source
+          diagnostics: diag.snapshot(),             // console + network, or null
           preview: body.slice(0, 140) || "Screenshot",
           status: "open",
           createdBy: { uid: state.me.uid, name: state.me.name, email: state.me.email },
@@ -427,7 +771,11 @@
           lastActivityAt: now(),
           messageCount: 1,
           appVersion: cfg.appVersion || null,
+          commit: cfg.commitSha || null,
+          branch: cfg.branch || null,
           viewport: window.innerWidth + "x" + window.innerHeight,
+          dpr: window.devicePixelRatio || 1,
+          scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
           userAgent: navigator.userAgent,
         },
       };
@@ -486,18 +834,31 @@
 
     /* ── anchoring ── */
     function anchorFromClick(ev) {
-      host.style.pointerEvents = "none"; // so elementFromPoint sees the page
+      /* Take the whole toolbar out of hit testing for this one call.
+       * Clearing pointer-events on the host is not enough: .overlay sets
+       * pointer-events: auto, so the hit lands on the overlay and
+       * elementFromPoint retargets it back to the shadow host - the pin
+       * would anchor to Pinstage itself. display:none has no such hole, and
+       * it leaves the host's own inline pointer-events: none intact, so the
+       * page stays clickable afterwards. */
+      host.style.display = "none";
       const el = document.elementFromPoint(ev.clientX, ev.clientY) || document.body;
-      host.style.pointerEvents = "";
+      host.style.display = "";
       const r = el.getBoundingClientRect();
       const de = document.documentElement;
-      return {
+      const anchor = {
         selector: cssPath(el),
         relX: r.width ? (ev.clientX - r.left) / r.width : 0.5,
         relY: r.height ? (ev.clientY - r.top) / r.height : 0.5,
         docXPct: ev.clientX / de.clientWidth,
         docYPct: (ev.clientY + window.scrollY) / Math.max(1, de.scrollHeight),
       };
+      /* anchor repositions the pin; context describes what was clicked. Kept
+       * apart so the fingerprint can grow without touching the geometry the
+       * pins depend on. */
+      let context = null;
+      try { context = contextFromElement(el); } catch { /* never block a comment */ }
+      return { anchor, context };
     }
 
     function anchorPoint(a) {
@@ -1004,7 +1365,7 @@
           await onSubmit(body, mentions, atts.map(({ blob, w, h }) => ({ blob, w, h })));
           atts.forEach((a) => URL.revokeObjectURL(a.objUrl));
         } catch (e) {
-          console.warn(e);
+          console.warn("[pinstage] post failed:", e);
           send.innerHTML = svg("send", 14) + "<span>Post</span>";
           send.disabled = false;
         }
@@ -1035,7 +1396,7 @@
       state.openThreadId = null;
     }
 
-    function openNewThreadCard(anchor, x, y) {
+    function openNewThreadCard(anchor, context, x, y) {
       closeCards();
       const card = document.createElement("div");
       card.className = "card";
@@ -1044,7 +1405,7 @@
       card.querySelector(".x").addEventListener("click", closeCards);
       card.appendChild(
         buildComposer("Describe the issue or leave feedback…", async (body, mentions, atts) => {
-          await createThread(anchor, body, mentions, atts);
+          await createThread(anchor, context, body, mentions, atts);
           closeCards();
           setMode("idle");
         })
@@ -1147,11 +1508,11 @@
         overlay.innerHTML = `<div class="hint">Click anywhere to leave a comment · Esc to exit</div>`;
         overlay.addEventListener("click", (ev) => {
           if (ev.target !== overlay) return;
-          const anchor = anchorFromClick(ev);
+          const { anchor, context } = anchorFromClick(ev);
           overlay.remove();
           state.mode = "idle";
           renderBar();
-          openNewThreadCard(anchor, ev.clientX, ev.clientY);
+          openNewThreadCard(anchor, context, ev.clientX, ev.clientY);
         });
         ui.layer.appendChild(overlay);
       }
