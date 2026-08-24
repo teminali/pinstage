@@ -85,7 +85,10 @@ async function rest(path, init = {}) {
     headers: { ...HEADERS, ...init.headers },
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-  return res.status === 204 ? null : res.json();
+  // Prefer: return=minimal answers 201/204 with an EMPTY body — parse text,
+  // never res.json() blindly, or inserts crash after succeeding.
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
 }
 
 const ts = () => ({ _ts: Date.now() });
