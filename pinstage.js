@@ -1398,6 +1398,12 @@
           );
         } else closeDropdown();
       });
+      ["keydown", "keypress", "keyup", "beforeinput"].forEach((evtName) => {
+        ta.addEventListener(evtName, (e) => {
+          e.stopPropagation();
+        }, true);
+      });
+
       ta.addEventListener("keydown", (e) => {
         if (e.key === "Escape") closeDropdown();
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !send.disabled) send.click();
