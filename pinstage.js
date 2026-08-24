@@ -846,32 +846,26 @@
     }
 
     /* ── anchoring ── */
-    function anchorFromClick(ev) {
-      /* Take the whole toolbar out of hit testing for this one call.
-       * Clearing pointer-events on the host is not enough: .overlay sets
-       * pointer-events: auto, so the hit lands on the overlay and
-       * elementFromPoint retargets it back to the shadow host - the pin
-       * would anchor to Pinstage itself. display:none has no such hole, and
-       * it leaves the host's own inline pointer-events: none intact, so the
-       * page stays clickable afterwards. */
+    function anchorFromPoint(clientX, clientY) {
       host.style.display = "none";
-      const el = document.elementFromPoint(ev.clientX, ev.clientY) || document.body;
+      const el = document.elementFromPoint(clientX, clientY) || document.body;
       host.style.display = "";
       const r = el.getBoundingClientRect();
       const de = document.documentElement;
       const anchor = {
         selector: cssPath(el),
-        relX: r.width ? (ev.clientX - r.left) / r.width : 0.5,
-        relY: r.height ? (ev.clientY - r.top) / r.height : 0.5,
-        docXPct: ev.clientX / de.clientWidth,
-        docYPct: (ev.clientY + window.scrollY) / Math.max(1, de.scrollHeight),
+        relX: r.width ? (clientX - r.left) / r.width : 0.5,
+        relY: r.height ? (clientY - r.top) / r.height : 0.5,
+        docXPct: clientX / de.clientWidth,
+        docYPct: (clientY + window.scrollY) / Math.max(1, de.scrollHeight),
       };
-      /* anchor repositions the pin; context describes what was clicked. Kept
-       * apart so the fingerprint can grow without touching the geometry the
-       * pins depend on. */
       let context = null;
       try { context = contextFromElement(el); } catch { /* never block a comment */ }
-      return { anchor, context };
+      return { anchor, context, element: el };
+    }
+
+    function anchorFromClick(ev) {
+      return anchorFromPoint(ev.clientX, ev.clientY);
     }
 
     function anchorPoint(a) {
@@ -1434,6 +1428,87 @@
       return html;
     }
 
+
+    function makeCardDraggable(card) {
+      const head = card.querySelector(".head");
+      if (!head) return;
+      head.style.cursor = "grab";
+      head.style.userSelect = "none";
+
+      head.addEventListener("pointerdown", (e) => {
+        if (e.target.closest("button, input, textarea, a, select")) return;
+        head.style.cursor = "grabbing";
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const rect = card.getBoundingClientRect();
+        const initLeft = rect.left;
+        const initTop = rect.top;
+
+        const onMove = (moveEv) => {
+          const dx = moveEv.clientX - startX;
+          const dy = moveEv.clientY - startY;
+          const w = card.offsetWidth || 340;
+          const h = card.offsetHeight || 300;
+          const maxLeft = Math.max(8, window.innerWidth - w - 8);
+          const maxTop = Math.max(8, window.innerHeight - h - 8);
+          const newLeft = Math.min(Math.max(8, initLeft + dx), maxLeft);
+          const newTop = Math.min(Math.max(8, initTop + dy), maxTop);
+          card.style.left = newLeft + "px";
+          card.style.top = newTop + "px";
+        };
+
+        const onUp = () => {
+          head.style.cursor = "grab";
+          removeEventListener("pointermove", onMove);
+          removeEventListener("pointerup", onUp);
+        };
+
+        addEventListener("pointermove", onMove);
+        addEventListener("pointerup", onUp);
+      });
+    }
+
+    function makePinDraggable(pin, onDrop, onClick) {
+      pin.style.cursor = "grab";
+      pin.style.touchAction = "none";
+
+      pin.addEventListener("pointerdown", (e) => {
+        e.stopPropagation();
+        pin.style.cursor = "grabbing";
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const pX = parseFloat(pin.style.left) || startX;
+        const pY = parseFloat(pin.style.top) || startY;
+        let hasMoved = false;
+
+        const onMove = (moveEv) => {
+          const dx = moveEv.clientX - startX;
+          const dy = moveEv.clientY - startY;
+          if (!hasMoved && Math.hypot(dx, dy) > 4) {
+            hasMoved = true;
+          }
+          if (hasMoved) {
+            pin.style.left = (pX + dx) + "px";
+            pin.style.top = (pY + dy) + "px";
+          }
+        };
+
+        const onUp = async (upEv) => {
+          pin.style.cursor = "grab";
+          removeEventListener("pointermove", onMove);
+          removeEventListener("pointerup", onUp);
+          if (!hasMoved) {
+            if (onClick) onClick(upEv);
+          } else {
+            if (onDrop) await onDrop(upEv.clientX, upEv.clientY);
+          }
+        };
+
+        addEventListener("pointermove", onMove);
+        addEventListener("pointerup", onUp);
+      });
+    }
+
     function placeCard(card, x, y) {
       ui.layer.appendChild(card);
       const r = card.getBoundingClientRect();
@@ -1446,21 +1521,52 @@
       state.openThreadId = null;
     }
 
-    function openNewThreadCard(anchor, context, x, y) {
+    function openNewThreadCard(initialAnchor, initialContext, initialX, initialY) {
       closeCards();
+      let curAnchor = initialAnchor;
+      let curContext = initialContext;
+      let curX = initialX;
+      let curY = initialY;
+
+      // Floating draggable placement pin marker
+      const tempPin = document.createElement("div");
+      tempPin.className = "pinbtn newpin st-open";
+      tempPin.textContent = "+";
+      tempPin.style.left = curX + "px";
+      tempPin.style.top = curY + "px";
+      tempPin.title = "Drag to move pin location";
+      ui.layer.appendChild(tempPin);
+
+      makePinDraggable(
+        tempPin,
+        async (dropX, dropY) => {
+          const res = anchorFromPoint(dropX, dropY);
+          curAnchor = res.anchor;
+          curContext = res.context;
+          curX = dropX;
+          curY = dropY;
+        },
+        null
+      );
+
       const card = document.createElement("div");
       card.className = "card";
       card.innerHTML = `<div class="head"><span class="av">${esc(initials(state.me.name))}</span>
         <span class="t">New comment</span><button class="x">${svg("x", 14)}</button></div>`;
-      card.querySelector(".x").addEventListener("click", closeCards);
+      card.querySelector(".x").addEventListener("click", () => {
+        tempPin.remove();
+        closeCards();
+      });
       card.appendChild(
         buildComposer("Describe the issue or leave feedback…", async (body, mentions, atts) => {
-          await createThread(anchor, context, body, mentions, atts);
+          await createThread(curAnchor, curContext, body, mentions, atts);
+          tempPin.remove();
           closeCards();
           setMode("idle");
         })
       );
-      placeCard(card, x, y);
+      placeCard(card, initialX, initialY);
+      makeCardDraggable(card);
     }
 
     async function openThreadCard(thread, x, y) {
@@ -1497,6 +1603,7 @@
         })
       );
       placeCard(card, x, y);
+      makeCardDraggable(card);
 
       const fill = async () => {
         const comments = await adapter.listComments(thread.id);
@@ -1551,8 +1658,19 @@
         pin.textContent = String(i + 1);
         pin.style.left = p.x + "px";
         pin.style.top = p.y + "px";
-        pin.title = "[" + meta.label + "] " + (t.data?.preview || "");
-        pin.addEventListener("click", () => openThreadCard(t, p.x, p.y));
+        pin.title = "[" + meta.label + "] " + (t.data?.preview || "") + " (Drag to move)";
+        makePinDraggable(
+          pin,
+          async (dropX, dropY) => {
+            const { anchor, context } = anchorFromPoint(dropX, dropY);
+            t.data.anchor = anchor;
+            t.data.context = context;
+            t.data.lastActivityAt = now();
+            await adapter.updateThreadData(t.id, t.data);
+            renderPins();
+          },
+          () => openThreadCard(t, p.x, p.y)
+        );
         ui.pins.appendChild(pin);
       });
     }
@@ -1643,6 +1761,7 @@
       };
       tabs.forEach((b) => b.addEventListener("click", () => showTab(b.dataset.t)));
       ui.layer.appendChild(card);
+      makeCardDraggable(card);
       await showTab(state.inboxTab);
     }
 
