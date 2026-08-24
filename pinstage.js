@@ -962,25 +962,27 @@
       .bar .badge { min-width: 17px; height: 17px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
         color: #16130a; font-size: 10px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; transition: all .2s; }
       .bar .badge.is-working {
-        background: #0284c7;
+        background: linear-gradient(135deg, #0284c7, #38bdf8);
         color: #ffffff;
-        animation: psBadgePulseBlue 1.3s infinite ease-in-out;
+        font-weight: 900;
+        animation: psBadgePulseBlue 1.2s infinite ease-in-out;
       }
       .bar .badge.is-deploying {
-        background: #9333ea;
+        background: linear-gradient(135deg, #9333ea, #c084fc);
         color: #ffffff;
-        animation: psBadgePulsePurple 1.3s infinite ease-in-out;
+        font-weight: 900;
+        animation: psBadgePulsePurple 1.2s infinite ease-in-out;
       }
 
       @keyframes psBadgePulseBlue {
-        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(2, 132, 199, 0.8); }
-        50% { transform: scale(1.22); box-shadow: 0 0 0 6px rgba(2, 132, 199, 0); }
-        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(2, 132, 199, 0); }
+        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.9), 0 0 8px rgba(14, 165, 233, 0.8); }
+        50% { transform: scale(1.28); box-shadow: 0 0 0 8px rgba(56, 189, 248, 0), 0 0 14px rgba(14, 165, 233, 0.9); }
+        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(56, 189, 248, 0), 0 0 8px rgba(14, 165, 233, 0.8); }
       }
       @keyframes psBadgePulsePurple {
-        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.8); }
-        50% { transform: scale(1.22); box-shadow: 0 0 0 6px rgba(147, 51, 234, 0); }
-        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(147, 51, 234, 0); }
+        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(192, 132, 252, 0.9), 0 0 8px rgba(147, 51, 234, 0.8); }
+        50% { transform: scale(1.28); box-shadow: 0 0 0 8px rgba(192, 132, 252, 0), 0 0 14px rgba(147, 51, 234, 0.9); }
+        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(192, 132, 252, 0), 0 0 8px rgba(147, 51, 234, 0.8); }
       }
       .dot { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); width: 34px; height: 34px;
         border-radius: 999px; background: #0e0f13; color: #fbbf24; border: 1px solid #2a2c33; pointer-events: auto;
