@@ -961,20 +961,20 @@
       .bar > button.active { background: #f59e0b; color: #16130a; }
       .bar .badge { min-width: 17px; height: 17px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
         color: #16130a; font-size: 10px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; transition: all .2s; }
+      .bar .badge.has-timer {
+        padding: 0 5px 0 1px;
+        gap: 2px;
+      }
       .bar .badge.is-working {
         background: #081926;
         border: 1px solid rgba(56, 189, 248, 0.5);
         color: #38bdf8;
-        padding: 0 5px 0 2px;
-        gap: 3px;
         box-shadow: 0 0 12px rgba(14, 165, 233, 0.4);
       }
       .bar .badge.is-deploying {
         background: #1c0d2e;
         border: 1px solid rgba(192, 132, 252, 0.5);
         color: #c084fc;
-        padding: 0 5px 0 2px;
-        gap: 3px;
         box-shadow: 0 0 12px rgba(147, 51, 234, 0.4);
       }
       .bar .badge .timer-ring {
