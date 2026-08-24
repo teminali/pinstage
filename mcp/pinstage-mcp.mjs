@@ -541,18 +541,7 @@ const TOOLS = [
         }
       });
 
-      const protocolHeader = [
-        "══════════════════════════════════════════════════════════════════════════════════",
-        "🤖 PINSTAGE SMART MULTI-AGENT COLLABORATION PROTOCOL:",
-        "• Pick a [SAFE TO CLAIM - NO CONFLICT] issue (marked ✅).",
-        "• NEVER pick [CONFLICT LOCK] issues (marked ⚠️) while another agent is working on the same file.",
-        "• ⚡ MANDATORY STEP 1: Immediately call pinstage_set_status({ id: \"<ID>\", status: \"in_progress\" })",
-        "  BEFORE reading files or writing code. (Activates live progress ring & claims the file lock).",
-        "• STAGING GUARD: For staging issues, evaluate if changes are Major (DB/Auth/Billing). If major, flag and await approval.",
-        "• LIFECYCLE: in_progress -> deploying (staging build) -> deployed (verify) -> resolved.",
-        "══════════════════════════════════════════════════════════════════════════════════",
-        "",
-      ].join("\n");
+      const protocolHeader = "================================================================================\nPINSTAGE AUTONOMOUS DEV & VERIFICATION PROTOCOL (V2.0.0 LOCKED CONTRACT):\n1. SELECT SAFE ISSUE:\n   • Pick a [SAFE TO CLAIM - NO CONFLICT] issue (marked with green check).\n   • Do NOT pick [CONFLICT LOCK] issues while another agent is modifying the target file.\n2. MANDATORY FIRST TOOL CALL:\n   • Immediately call `pinstage_set_status({ id: \"<ID>\", status: \"in_progress\" })` BEFORE reading files or writing code.\n   • This claims the file lock and activates the live circular progress timer on the user screen.\n3. SURGICAL FIX & NON-REGRESSION GUARANTEE:\n   • Locate target code via `pinstage_get_context` and searchKeys.\n   • Make surgical, precise edits. Do NOT break existing features, layouts, or translations.\n   • Preserve all existing types, props, and handlers. Never introduce regressions.\n4. RIGOROUS END-TO-END VERIFICATION:\n   • Always cross-check, double-check, and verify before moving to another issue.\n   • Run type check (e.g. `tsc --noEmit`) and build checks to confirm zero errors.\n5. DEPLOY & RESOLUTION LIFECYCLE:\n   • Staging: status `deploying` -> run deploy script -> status `deployed` -> `pinstage_resolve`.\n   • Dev: status `deployed` -> `pinstage_resolve`.\n================================================================================\n";
 
       return protocolHeader + rows.map((r) => threadLine(r, true, lockedSignatures)).join("\n\n") + "\n\nUse pinstage_get_context or pinstage_get_issue for the full thread.";
     },
