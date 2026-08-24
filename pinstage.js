@@ -1057,7 +1057,7 @@
       .compose textarea { width: 100%; min-height: 60px; resize: none; background: #16181d; color: #e7e8ea;
         border: 1px solid #2a2c33; border-radius: 10px; padding: 8px 10px; font-size: 13px; line-height: 1.4; outline: none; }
       .compose textarea:focus { border-color: #f59e0b55; }
-      .chips { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+      .chips { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; max-height: 130px; overflow-y: auto; }
       .chip { position: relative; width: 56px; height: 42px; border-radius: 8px; overflow: hidden; border: 1px solid #2a2c33; }
       .chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
       .chip button { position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 999px;
@@ -1495,7 +1495,7 @@
       };
 
       function addAttachment(blob) {
-        if (!blob || atts.length >= 3) return;
+        if (!blob || atts.length >= 10) return;
         const objUrl = URL.createObjectURL(blob);
         const img = new Image();
         img.onload = () => {
@@ -1553,25 +1553,47 @@
         const file = document.createElement("input");
         file.type = "file";
         file.accept = "image/*";
+        file.multiple = true;
         file.style.display = "none";
         file.addEventListener("change", () => {
-          if (file.files?.[0]) addAttachment(file.files[0]);
+          if (file.files?.length) {
+            for (const f of Array.from(file.files)) addAttachment(f);
+          }
           file.value = "";
         });
         const pick = document.createElement("button");
         pick.className = "iconbtn";
         pick.innerHTML = svg("image");
-        pick.title = "Attach an image (or paste one into the text box)";
+        pick.title = "Attach images (or paste multiple images into the text box)";
         pick.addEventListener("click", () => file.click());
         row.appendChild(pick);
         row.appendChild(file);
 
+        // Multi-image clipboard paste support
         ta.addEventListener("paste", (e) => {
-          const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith("image/"));
-          if (item) {
+          const items = [...(e.clipboardData?.items || [])].filter((i) => i.type.startsWith("image/"));
+          if (items.length) {
             e.preventDefault();
-            addAttachment(item.getAsFile());
+            for (const item of items) {
+              const f = item.getAsFile();
+              if (f) addAttachment(f);
+            }
           }
+        });
+
+        // Drag and drop multiple image files onto composer
+        wrap.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          wrap.style.borderColor = "#f59e0b88";
+        });
+        wrap.addEventListener("dragleave", () => {
+          wrap.style.borderColor = "";
+        });
+        wrap.addEventListener("drop", (e) => {
+          e.preventDefault();
+          wrap.style.borderColor = "";
+          const files = [...(e.dataTransfer?.files || [])].filter((f) => f.type.startsWith("image/"));
+          for (const f of files) addAttachment(f);
         });
       }
 
