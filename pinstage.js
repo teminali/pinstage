@@ -713,6 +713,8 @@
       threads: [],
       mode: "idle",
       openThreadId: null,
+      activeThreadRefresher: null,
+      activeInboxRefresher: null,
       inboxOpen: false,
       inboxTab: "open",
       hidden: storedHidden != null ? storedHidden === "1" : !!cfg.startHidden,
@@ -838,6 +840,7 @@
           state.threads[idx].data = data;
         } else {
           await loadThreadsForPage();
+      startRealtimeSync();
         }
       }
       await adapter.updateThreadData(threadId, data);
@@ -1564,6 +1567,9 @@
     function closeCards() {
       ui.layer.innerHTML = "";
       state.openThreadId = null;
+      state.activeThreadRefresher = null;
+      state.activeInboxRefresher = null;
+      state.inboxOpen = false;
     }
 
     function openNewThreadCard(initialAnchor, initialContext, initialX, initialY) {
@@ -1771,10 +1777,10 @@
       card.querySelector(".x").addEventListener("click", () => { state.inboxOpen = false; closeCards(); });
       const rowsBox = card.querySelector(".rows");
       const tabs = card.querySelectorAll(".tabs button");
-      const showTab = async (tab) => {
+      const showTab = async (tab, silent = false) => {
         state.inboxTab = tab;
         tabs.forEach((b) => b.classList.toggle("on", b.dataset.t === tab));
-        rowsBox.innerHTML = `<div class="empty">Loading…</div>`;
+        if (!silent) rowsBox.innerHTML = `<div class="empty">Loading…</div>`;
         const list = await adapter.listThreads({ project, status: tab });
         rowsBox.innerHTML = "";
         if (!list.length) {
@@ -1807,10 +1813,38 @@
       tabs.forEach((b) => b.addEventListener("click", () => showTab(b.dataset.t)));
       ui.layer.appendChild(card);
       makeCardDraggable(card);
+      state.activeInboxRefresher = (tab) => showTab(tab, true);
       await showTab(state.inboxTab);
     }
 
     /* ── the bar ── */
+    
+    /* ── realtime sync engine ── */
+    let syncTimer = null;
+    async function syncRealtime() {
+      if (document.hidden || state.hidden) return;
+      try {
+        await loadThreadsForPage();
+        if (state.openThreadId && state.activeThreadRefresher) {
+          await state.activeThreadRefresher();
+        }
+        if (state.inboxOpen && state.activeInboxRefresher) {
+          await state.activeInboxRefresher(state.inboxTab);
+        }
+      } catch (e) {
+        // silent
+      }
+    }
+
+    function startRealtimeSync() {
+      if (syncTimer) clearInterval(syncTimer);
+      syncTimer = setInterval(syncRealtime, 2500);
+      addEventListener("focus", syncRealtime);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) syncRealtime();
+      });
+    }
+
     function renderBar() {
       ui.bar.innerHTML = "";
       if (state.hidden) {
