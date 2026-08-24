@@ -962,27 +962,34 @@
       .bar .badge { min-width: 17px; height: 17px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
         color: #16130a; font-size: 10px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; transition: all .2s; }
       .bar .badge.is-working {
-        background: linear-gradient(135deg, #0284c7, #38bdf8);
-        color: #ffffff;
-        font-weight: 900;
-        animation: psBadgePulseBlue 1.2s infinite ease-in-out;
+        background: #081926;
+        border: 1px solid rgba(56, 189, 248, 0.5);
+        color: #38bdf8;
+        padding: 0 5px 0 2px;
+        gap: 3px;
+        box-shadow: 0 0 12px rgba(14, 165, 233, 0.4);
       }
       .bar .badge.is-deploying {
-        background: linear-gradient(135deg, #9333ea, #c084fc);
-        color: #ffffff;
-        font-weight: 900;
-        animation: psBadgePulsePurple 1.2s infinite ease-in-out;
+        background: #1c0d2e;
+        border: 1px solid rgba(192, 132, 252, 0.5);
+        color: #c084fc;
+        padding: 0 5px 0 2px;
+        gap: 3px;
+        box-shadow: 0 0 12px rgba(147, 51, 234, 0.4);
       }
-
-      @keyframes psBadgePulseBlue {
-        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.9), 0 0 8px rgba(14, 165, 233, 0.8); }
-        50% { transform: scale(1.28); box-shadow: 0 0 0 8px rgba(56, 189, 248, 0), 0 0 14px rgba(14, 165, 233, 0.9); }
-        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(56, 189, 248, 0), 0 0 8px rgba(14, 165, 233, 0.8); }
+      .bar .badge .timer-ring {
+        display: block;
+        flex-shrink: 0;
       }
-      @keyframes psBadgePulsePurple {
-        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(192, 132, 252, 0.9), 0 0 8px rgba(147, 51, 234, 0.8); }
-        50% { transform: scale(1.28); box-shadow: 0 0 0 8px rgba(192, 132, 252, 0), 0 0 14px rgba(147, 51, 234, 0.9); }
-        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(192, 132, 252, 0), 0 0 8px rgba(147, 51, 234, 0.8); }
+      .bar .badge .ring-fg {
+        transition: stroke-dashoffset 0.5s cubic-bezier(0.4, 0, 0.2, 1), stroke 0.3s ease;
+      }
+      .bar .badge .timer-sec {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 9.5px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        line-height: 1;
       }
       .dot { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); width: 34px; height: 34px;
         border-radius: 999px; background: #0e0f13; color: #fbbf24; border: 1px solid #2a2c33; pointer-events: auto;
@@ -2086,6 +2093,24 @@
       });
     }
 
+    let badgeTickerTimer = null;
+    function updateBadgeProgress(badgeEl, startTime, isDeploying) {
+      if (!badgeEl) return;
+      const elapsedSec = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
+      const targetEstimate = isDeploying ? 95 : 45;
+      const ratio = elapsedSec / targetEstimate;
+      const progress = ratio < 0.85 ? ratio : 0.85 + (0.10 * (1 - Math.exp(-(ratio - 0.85) * 2)));
+      const clampedProgress = Math.min(0.95, Math.max(0.04, progress));
+      const circumference = 44;
+      const offset = circumference - (circumference * clampedProgress);
+
+      const ringFg = badgeEl.querySelector(".ring-fg");
+      const timerSec = badgeEl.querySelector(".timer-sec");
+      if (ringFg) ringFg.setAttribute("stroke-dashoffset", offset.toFixed(1));
+      if (timerSec) timerSec.textContent = elapsedSec + "s";
+      badgeEl.title = (isDeploying ? "Deploying fix to staging" : "Autonomous fix in progress") + " · " + elapsedSec + "s elapsed";
+    }
+
     function renderBar() {
       ui.bar.innerHTML = "";
       if (state.hidden) {
@@ -2111,8 +2136,25 @@
       const hasDeploying = state.threads.some((t) => t.data?.status === "deploying");
       const badgeCls = "badge" + (hasDeploying ? " is-deploying" : hasWorking ? " is-working" : "");
 
+      let badgeHTML = "";
+      if (state.threads.length) {
+        if (hasWorking) {
+          const isDeploying = !!hasDeploying;
+          const strokeColor = isDeploying ? "#c084fc" : "#38bdf8";
+          badgeHTML = `<span class="${badgeCls} has-timer">
+            <svg class="timer-ring" width="16" height="16" viewBox="0 0 18 18">
+              <circle class="ring-bg" cx="9" cy="9" r="7" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2.2" />
+              <circle class="ring-fg" cx="9" cy="9" r="7" fill="none" stroke="${strokeColor}" stroke-width="2.2" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="44" transform="rotate(-90 9 9)" />
+            </svg>
+            <span class="timer-sec">0s</span>
+          </span>`;
+        } else {
+          badgeHTML = `<span class="${badgeCls}">${state.threads.length}</span>`;
+        }
+      }
+
       const inbox = document.createElement("button");
-      inbox.innerHTML = svg("inbox", 14) + `<span>Issues</span>${state.threads.length ? `<span class="${badgeCls}">${state.threads.length}</span>` : ""}`;
+      inbox.innerHTML = svg("inbox", 14) + `<span>Issues</span>${badgeHTML}`;
       inbox.title = "All reported issues";
       inbox.addEventListener("click", () => {
         state.inboxOpen = !state.inboxOpen;
@@ -2128,6 +2170,21 @@
       bar.appendChild(hide);
 
       ui.bar.appendChild(bar);
+
+      if (badgeTickerTimer) { clearInterval(badgeTickerTimer); badgeTickerTimer = null; }
+      if (hasWorking) {
+        const badgeEl = bar.querySelector(".badge.has-timer");
+        const activeThread = state.threads.find((t) => t.data?.status === "deploying") ||
+                            state.threads.find((t) => t.data?.status === "in_progress");
+        const startTime = activeThread?.data?.lastActivityAt?._ts ||
+                          activeThread?.data?.createdAt?._ts ||
+                          Date.now();
+        const isDeploying = !!hasDeploying;
+        updateBadgeProgress(badgeEl, startTime, isDeploying);
+        badgeTickerTimer = setInterval(() => {
+          updateBadgeProgress(badgeEl, startTime, isDeploying);
+        }, 1000);
+      }
     }
 
     /* ── SPA navigation: reload pins when the host app changes routes ── */
