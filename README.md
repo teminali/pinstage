@@ -165,7 +165,7 @@ claude mcp add pinstage -- node /path/to/pinstage/mcp/pinstage-mcp.mjs \
 
 Config via env (or the `--env-file`): `PINSTAGE_SUPABASE_URL` /
 `PINSTAGE_SERVICE_KEY` (fall back to `NEXT_PUBLIC_SUPABASE_URL` /
-`SUPABASE_ROLE_SERVICE_KEY` naming used by Supabase apps), optional
+`SUPABASE_SERVICE_ROLE_KEY` naming used by Supabase apps), optional
 `PINSTAGE_PROJECT` default filter and `PINSTAGE_AUTHOR_NAME` for the name
 stamped on the agent's replies. The service key stays inside the MCP process;
 the agent only ever sees tool results.
