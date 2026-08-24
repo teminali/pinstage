@@ -155,6 +155,33 @@ lines in the `--env-file`. Environment wins over the file.
 The fallbacks mean that for a typical Supabase app, pointing `--env-file` at
 the `.env.local` you already have is a complete setup.
 
+## Agent Operating Modes & Workflow
+
+When starting a session or connecting to the Pinstage MCP, agents can run in three distinct modes:
+
+1. 🔄 **Auto Dev Mode (Autonomous Infinite Loop)**:
+   - Continuously polls for new incoming issues every 1–2 minutes.
+   - Sets status to `in_progress` (**mandatory first step**, activating the live blue pulsing badge on screen).
+   - Inspects DOM context and diagnostics via `pinstage_get_context`.
+   - Codes the fix.
+   - **Staging issues**: Sets status to `deploying` (purple pulse) ➔ Deploys staging build ➔ Sets `deployed` (emerald) ➔ Resolves issue (`pinstage_resolve`).
+   - **Dev issues**: Sets status to `deployed` (ready for test) ➔ Resolves issue.
+   - Runs indefinitely in the background until paused or stopped by the user.
+
+2. 📦 **Fix Existing Issues & Stop**:
+   - Fetches all open issues in the queue.
+   - Resolves them sequentially (or in optimized staging batches to minimize builds).
+   - Deploys, verifies, marks resolved, and finishes the session.
+
+3. 🎯 **Fix Specific Issue(s)**:
+   - Displays all open issues with previews/IDs and lets the developer pick which one(s) to fix.
+
+### Major Staging Issue Safety Guard
+- When an issue is reported from a **Staging** environment, the agent checks if it is a **Major Issue** before writing code:
+  - ⚠️ **Major Criteria**: DB migrations, security/RLS changes, payment/billing alterations, or destructive data operations.
+  - ✅ **Routine**: UI/UX fixes, styling, component bugs, copy/translations, query params.
+- If flagged as major, the agent marks `[⚠️ Flagged: Major change — awaiting developer review]`, presents the plan, and waits for explicit approval before proceeding.
+
 ## Tools
 
 ### `pinstage_list_issues`
