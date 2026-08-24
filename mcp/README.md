@@ -41,7 +41,7 @@ When an AI coding assistant connects to Pinstage, it operates across 3 standardi
 
 ### Major Staging Issue Safety Guard
 - **High Threshold**: Database schema migrations, security/RLS changes, payment processing alterations, or destructive data operations.
-- **Protocol**: Major issues are flagged (`[⚠️ Flagged: Major change — awaiting developer review]`), and the agent presents the implementation plan in chat and waits for explicit developer review before executing. Routine UI/UX, styling, and component bugs proceed automatically.
+- **Protocol**: Major issues are flagged (`[⚠️ Flagged: Major change - awaiting developer review]`), and the agent presents the implementation plan in chat and waits for explicit developer review before executing. Routine UI/UX, styling, and component bugs proceed automatically.
 
 ## Why the context matters
 
@@ -160,7 +160,7 @@ the `.env.local` you already have is a complete setup.
 When starting a session or connecting to the Pinstage MCP, agents can run in three distinct modes:
 
 1. 🔄 **Auto Dev Mode (Autonomous Infinite Loop)**:
-   - Continuously polls for new incoming issues every 1–2 minutes.
+   - Continuously polls for new incoming issues every 1-2 minutes.
    - Sets status to `in_progress` (**mandatory first step**, activating the live blue pulsing badge on screen).
    - Inspects DOM context and diagnostics via `pinstage_get_context`.
    - Codes the fix.
@@ -180,7 +180,7 @@ When starting a session or connecting to the Pinstage MCP, agents can run in thr
 - When an issue is reported from a **Staging** environment, the agent checks if it is a **Major Issue** before writing code:
   - ⚠️ **Major Criteria**: DB migrations, security/RLS changes, payment/billing alterations, or destructive data operations.
   - ✅ **Routine**: UI/UX fixes, styling, component bugs, copy/translations, query params.
-- If flagged as major, the agent marks `[⚠️ Flagged: Major change — awaiting developer review]`, presents the plan, and waits for explicit approval before proceeding.
+- If flagged as major, the agent marks `[⚠️ Flagged: Major change - awaiting developer review]`, presents the plan, and waits for explicit approval before proceeding.
 
 ## Tools
 

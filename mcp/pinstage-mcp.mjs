@@ -313,9 +313,9 @@ function threadLine({ id, data: d }, withContext = true, lockedSignatures = new 
   } else if (d.status === "open") {
     if (lockedSignatures.has(sig)) {
       const locker = lockedSignatures.get(sig);
-      safetyTag = `\n  ⚠️ [CONFLICT LOCK — WAITING ON ACTIVE FIX on ${sig}]\n     Another agent is currently modifying ${sig} for issue ${locker.id}. Skip this to avoid merge/code overwrite conflicts.`;
+      safetyTag = `\n  ⚠️ [CONFLICT LOCK - WAITING ON ACTIVE FIX on ${sig}]\n     Another agent is currently modifying ${sig} for issue ${locker.id}. Skip this to avoid merge/code overwrite conflicts.`;
     } else {
-      safetyTag = `\n  ✅ [SAFE TO CLAIM — NO CONFLICT] (Target: ${sig})`;
+      safetyTag = `\n  ✅ [SAFE TO CLAIM - NO CONFLICT] (Target: ${sig})`;
     }
   }
 
@@ -544,7 +544,7 @@ const TOOLS = [
       const protocolHeader = [
         "══════════════════════════════════════════════════════════════════════════════════",
         "🤖 PINSTAGE SMART MULTI-AGENT COLLABORATION PROTOCOL:",
-        "• Pick a [SAFE TO CLAIM — NO CONFLICT] issue (marked ✅).",
+        "• Pick a [SAFE TO CLAIM - NO CONFLICT] issue (marked ✅).",
         "• NEVER pick [CONFLICT LOCK] issues (marked ⚠️) while another agent is working on the same file.",
         "• ⚡ MANDATORY STEP 1: Immediately call pinstage_set_status({ id: \"<ID>\", status: \"in_progress\" })",
         "  BEFORE reading files or writing code. (Activates live progress ring & claims the file lock).",

@@ -27,7 +27,7 @@ Ask the user which mode they want to run:
 ## 2. Major Staging Issue Safety Guard
 For issues reported on **Staging**:
 - ⚠️ **High Threshold Major Issues**: Database schema alterations, security/RLS changes, payment processing/billing logic alterations, or destructive data changes.
-- **Protocol**: If an issue qualifies as Major, do NOT implement immediately. Post a reply `[⚠️ Flagged: Major change — awaiting developer review]`, present the implementation plan in chat, and wait for explicit developer approval.
+- **Protocol**: If an issue qualifies as Major, do NOT implement immediately. Post a reply `[⚠️ Flagged: Major change - awaiting developer review]`, present the implementation plan in chat, and wait for explicit developer approval.
 - ✅ **Routine Issues** (UI, copy, styles, standard component bugs) are implemented directly without blocking.
 
 ## 3. Live Status Contract
