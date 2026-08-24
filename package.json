@@ -1,6 +1,6 @@
 {
   "name": "pinstage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Pin comments on your staging environment — Figma/Vercel-style pinned threads with annotated screenshots, @mentions, and a team gate. Backend-agnostic via a small adapter interface. One file, zero dependencies.",
   "main": "pinstage.js",
   "files": ["pinstage.js", "examples"],

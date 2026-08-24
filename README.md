@@ -52,8 +52,12 @@ the pages where it should exist — typically your staging build only:
 </script>
 ```
 
-> The **host** decides where the toolbar runs. Load the script on staging
-> only; the SDK itself is environment-agnostic on purpose.
+> The **host** decides where the toolbar runs — the SDK itself is
+> environment-agnostic. Staging is the natural home, but it runs on
+> **production** too: pass `environmentLabel: "Production"` and
+> `startHidden: true`, and Pinstage boots as a small dot with **no pins on
+> the page** until the user expands it — comments never float around for
+> someone who didn't ask. The choice is remembered per user per project.
 
 ## Backends: the adapter interface
 
@@ -141,15 +145,26 @@ security fencing everything to the roster — is in
 - Wire-level names (`mdTeamMembers` defaults, `?mdthread=` deep-link param,
   `md_toolbar_mention`) predate the Pinstage name and are kept stable.
 
+## Building a dashboard on top
+
+Pinstage deliberately has no server of its own, so "the API" is your data
+store: with the Supabase adapter, `feedbackThreads` / `feedbackComments` /
+the team roster are plain tables readable through PostgREST, SQL, or any
+Supabase client — from an admin panel, a cron job, or a CLI. M-Digital's
+admin panel (issues inbox with reply/resolve and deep links back to the pins)
+is exactly that: a page reading the same rows. If you implement a custom
+adapter, point your dashboard at whatever store it writes.
+
 ## Roadmap
 
-- **Chrome extension distribution** — an options page mapping
-  `domain pattern → project → backend config`, with a content script that
-  injects this same file. The open problem is the auth bridge (a content
-  script cannot read the host app's session directly); until that is solved
-  per-app, the script-tag install remains the recommended path — it also
-  works in every browser, including mobile.
+- **Chrome extension distribution** — a second install channel next to the
+  script tag: an options page mapping `domain pattern → project → backend
+  config`, a content script injecting this same file. The open problem is the
+  auth bridge (a content script cannot read the host app's session directly);
+  until that is solved per-app, the script-tag install remains the
+  recommended path — it also works in every browser, including mobile.
 - Ready-made adapters for Firebase and plain-REST backends.
+- First-party read helpers for dashboard builders.
 
 ## License
 

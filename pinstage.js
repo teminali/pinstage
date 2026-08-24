@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * Pinstage — pin comments on your staging environment
  * https://github.com/teminali/pinstage · MIT © Teminali
- * v0.2.0
+ * v0.2.1
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Figma/Vercel-style pinned comment threads for your STAGING environment:
@@ -347,6 +347,15 @@
     const project = cfg.project || "unknown";
     const canAttach = typeof adapter.uploadAttachment === "function";
 
+    /* Production-friendly quiet mode: with startHidden true the toolbar
+     * boots as the small dot and pins stay off the page until the user
+     * expands it — comments never "float around" for someone who didn't ask.
+     * The choice is remembered per user per project. */
+    const HIDE_KEY = "pinstage:" + project + ":hidden";
+    const storedHidden = (() => {
+      try { return localStorage.getItem(HIDE_KEY); } catch { return null; }
+    })();
+
     const state = {
       me: null,
       team: [],
@@ -355,9 +364,17 @@
       openThreadId: null,
       inboxOpen: false,
       inboxTab: "open",
-      hidden: false,
+      hidden: storedHidden != null ? storedHidden === "1" : !!cfg.startHidden,
       pathname: location.pathname,
     };
+
+    function setHidden(v) {
+      state.hidden = v;
+      try { localStorage.setItem(HIDE_KEY, v ? "1" : "0"); } catch { /* private mode */ }
+      if (v) { closeCards(); setMode("idle"); }
+      renderBar();
+      renderPins();
+    }
 
     /* ── data flows on top of the adapter ── */
 
@@ -1200,7 +1217,7 @@
         dot.className = "dot";
         dot.title = "Pinstage";
         dot.innerHTML = svg("pin");
-        dot.addEventListener("click", () => { state.hidden = false; renderBar(); renderPins(); });
+        dot.addEventListener("click", () => setHidden(false));
         ui.bar.appendChild(dot);
         return;
       }
@@ -1227,7 +1244,7 @@
       const hide = document.createElement("button");
       hide.innerHTML = svg("minus", 14);
       hide.title = "Hide toolbar";
-      hide.addEventListener("click", () => { state.hidden = true; closeCards(); setMode("idle"); renderBar(); renderPins(); });
+      hide.addEventListener("click", () => setHidden(true));
       bar.appendChild(hide);
 
       ui.bar.appendChild(bar);
