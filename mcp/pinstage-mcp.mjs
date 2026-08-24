@@ -216,6 +216,7 @@ function contextBlock(d) {
   const rows = [];
   const add = (k, v) => { if (has(v)) rows.push([k, v]); };
 
+  add("environment", d.environment || (d.hostname === "localhost" || d.hostname === "127.0.0.1" ? "dev (localhost)" : "staging"));
   add("page", `${d.path ?? "?"}${d.query ?? ""}${d.hash ?? ""}`);
   add(
     "viewport",
@@ -289,7 +290,7 @@ function diagnosticsBlock(d) {
 function threadLine({ id, data: d }, withContext = true) {
   const lines = [
     `[${d.status}] ${id}`,
-    `  ${d.project ?? "?"} ${d.path ?? "?"}${d.query ?? ""}  (v${d.appVersion ?? "?"}, ${d.viewport ?? "?"})`,
+    `  ${d.project ?? "?"} ${d.path ?? "?"}${d.query ?? ""}  ([${d.environment || "staging"}] v${d.appVersion ?? "?"}, ${d.viewport ?? "?"})`,
   ];
   if (withContext) {
     const el = elementRef(d);
@@ -347,6 +348,7 @@ function contextPayload({ id, data: d }, screenshots) {
     id,
     status: d.status,
     project: d.project ?? null,
+    environment: ((d.environment || "").toLowerCase().includes("dev") || d.hostname === "localhost" || d.hostname === "127.0.0.1") ? "dev" : "staging",
     preview: d.preview ?? null,
     page: { path: d.path ?? null, query: d.query || null, hash: d.hash || null, scroll: d.scroll ?? null },
     build: { appVersion: d.appVersion ?? null, commit: d.commit ?? null, branch: d.branch ?? null },
@@ -473,17 +475,25 @@ const TOOLS = [
   {
     name: "pinstage_list_issues",
     description:
-      "List Pinstage issue threads (comments pinned on the app by the team). Returns id, status, project, page path, the element and source file the pin sits on, a diagnostics summary, preview, author, and activity. Default: open issues only.",
+      "List Pinstage issue threads (comments pinned on the app by the team). Returns id, status (open, in_progress, deploying, deployed, resolved), project, page path, the element and source file the pin sits on, a diagnostics summary, preview, author, and activity. Default: active (non-resolved) issues.",
     inputSchema: {
       type: "object",
       properties: {
-        status: { type: "string", enum: ["open", "resolved", "all"], description: "Filter by status (default open)" },
+        status: {
+          type: "string",
+          enum: ["active", "open", "in_progress", "deploying", "deployed", "resolved", "all"],
+          description: "Filter by status (default active: open, in_progress, deploying, deployed)",
+        },
         project: { type: "string", description: "Filter by project name" + (DEFAULT_PROJECT ? ` (default ${DEFAULT_PROJECT})` : "") },
       },
     },
-    handler: async ({ status = "open", project = DEFAULT_PROJECT }) => {
+    handler: async ({ status = "active", project = DEFAULT_PROJECT }) => {
       let q = `${T_THREADS}?select=id,data&limit=300`;
-      if (status !== "all") q += `&data->>status=eq.${status}`;
+      if (status === "active") {
+        q += `&data->>status=neq.resolved`;
+      } else if (status !== "all") {
+        q += `&data->>status=eq.${status}`;
+      }
       if (project) q += `&data->>project=eq.${encodeURIComponent(project)}`;
       const rows = (await rest(q)).sort((a, b) => activity(b.data) - activity(a.data));
       if (!rows.length) return `No ${status === "all" ? "" : status + " "}issues.`;
@@ -533,6 +543,43 @@ const TOOLS = [
       await postComment(id, text);
       await patchThread(id, { ...t.data, lastActivityAt: ts(), messageCount: (t.data.messageCount || 0) + 1 });
       return `Replied on ${id}.`;
+    },
+  },
+  {
+    name: "pinstage_set_status",
+    description:
+      "Update the live progress status of a Pinstage issue thread. Statuses: \x27in_progress\x27 (agent has begun working on the fix), \x27deploying\x27 (fix is building/deploying to staging), \x27deployed\x27 (fix is live on staging ready to test), \x27open\x27 (reset to open), or \x27resolved\x27 (verified and closed). Optionally posts a comment note.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Thread id" },
+        status: {
+          type: "string",
+          enum: ["open", "in_progress", "deploying", "deployed", "resolved"],
+          description: "New status for the issue",
+        },
+        note: { type: "string", description: "Optional progress note or reply" },
+      },
+      required: ["id", "status"],
+    },
+    handler: async ({ id, status, note }) => {
+      const t = await getThread(id);
+      if (note) await postComment(id, note);
+      const data = {
+        ...t.data,
+        status,
+        lastActivityAt: ts(),
+        messageCount: (t.data.messageCount || 0) + (note ? 1 : 0),
+      };
+      if (status === "resolved") {
+        data.resolvedBy = { uid: "mcp", name: AUTHOR };
+        data.resolvedAt = ts();
+      } else if (data.resolvedBy) {
+        delete data.resolvedBy;
+        delete data.resolvedAt;
+      }
+      await patchThread(id, data);
+      return `Status of ${id} set to '${status}'${note ? " with note" : ""}.`;
     },
   },
   {

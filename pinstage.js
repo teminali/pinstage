@@ -590,9 +590,15 @@
       },
 
       async listThreads({ project, path, status }) {
-        let q = T.threads + "?select=id,data&data->>project=eq." + encodeURIComponent(project) +
-          "&data->>status=eq." + encodeURIComponent(status) +
-          "&order=data->lastActivityAt->_ts.desc.nullslast&limit=100";
+        let q = T.threads + "?select=id,data&data->>project=eq." + encodeURIComponent(project);
+        if (status === "open" || status === "active" || !status) {
+          q += "&data->>status=neq.resolved";
+        } else if (status === "resolved") {
+          q += "&data->>status=eq.resolved";
+        } else if (status !== "all") {
+          q += "&data->>status=eq." + encodeURIComponent(status);
+        }
+        q += "&order=data->lastActivityAt->_ts.desc.nullslast&limit=100";
         if (path != null) q += "&data->>path=eq." + encodeURIComponent(path);
         return rest(q);
       },
@@ -770,6 +776,8 @@
           createdAt: now(),
           lastActivityAt: now(),
           messageCount: 1,
+          environment: cfg.environmentLabel || (location.hostname === "localhost" || location.hostname === "127.0.0.1" ? "Dev" : "Staging"),
+          hostname: location.hostname,
           appVersion: cfg.appVersion || null,
           commit: cfg.commitSha || null,
           branch: cfg.branch || null,
@@ -821,13 +829,18 @@
       if (status === "resolved") {
         data.resolvedBy = { uid: state.me.uid, name: state.me.name };
         data.resolvedAt = now();
+        state.threads = state.threads.filter((t) => t.id !== threadId);
       } else {
         delete data.resolvedBy;
         delete data.resolvedAt;
+        const idx = state.threads.findIndex((t) => t.id === threadId);
+        if (idx !== -1) {
+          state.threads[idx].data = data;
+        } else {
+          await loadThreadsForPage();
+        }
       }
       await adapter.updateThreadData(threadId, data);
-      state.threads = state.threads.filter((t) => t.id !== threadId);
-      if (status === "open") await loadThreadsForPage();
       renderPins();
       renderBar();
     }
@@ -910,6 +923,43 @@
         background: #f59e0b; color: #16130a; font-size: 12px; font-weight: 800; justify-content: center;
         pointer-events: auto; border: 2px solid #fff; box-shadow: 0 3px 10px rgba(0,0,0,.35); transition: transform .12s; }
       .pinbtn:hover { transform: scale(1.12); }
+      .pinbtn.st-open { background: #f59e0b; color: #16130a; }
+      .pinbtn.st-in-progress { background: #0284c7; color: #fff; animation: psPulseBlue 1.8s infinite; }
+      .pinbtn.st-deploying { background: #9333ea; color: #fff; animation: psPulsePurple 1.8s infinite; }
+      .pinbtn.st-deployed { background: #059669; color: #fff; }
+      .pinbtn.st-resolved { background: #475569; color: #cbd5e1; opacity: .75; }
+
+      @keyframes psPulseBlue {
+        0% { box-shadow: 0 0 0 0 rgba(2, 132, 199, 0.7); }
+        70% { box-shadow: 0 0 0 9px rgba(2, 132, 199, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(2, 132, 199, 0); }
+      }
+      @keyframes psPulsePurple {
+        0% { box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.7); }
+        70% { box-shadow: 0 0 0 9px rgba(147, 51, 234, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(147, 51, 234, 0); }
+      }
+
+      .stbadge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; font-size: 10.5px; font-weight: 700; border: 1px solid transparent; }
+      .stbadge .stdot { width: 5px; height: 5px; border-radius: 999px; }
+      .stbadge.st-open { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
+      .stbadge.st-open .stdot { background: #fbbf24; }
+      .stbadge.st-in-progress { background: rgba(2, 132, 199, 0.18); color: #38bdf8; border-color: rgba(56, 189, 248, 0.4); }
+      .stbadge.st-in-progress .stdot { background: #38bdf8; animation: psDotPulse 1.2s infinite; }
+      .stbadge.st-deploying { background: rgba(147, 51, 234, 0.18); color: #c084fc; border-color: rgba(192, 132, 252, 0.4); }
+      .stbadge.st-deploying .stdot { background: #c084fc; animation: psDotPulse 1.2s infinite; }
+      .stbadge.st-deployed { background: rgba(5, 150, 105, 0.18); color: #34d399; border-color: rgba(52, 211, 153, 0.4); }
+      .stbadge.st-deployed .stdot { background: #34d399; }
+      .stbadge.st-resolved { background: rgba(71, 85, 105, 0.25); color: #94a3b8; border-color: rgba(148, 163, 184, 0.25); }
+      .stbadge.st-resolved .stdot { background: #94a3b8; }
+
+      @keyframes psDotPulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: .4; transform: scale(0.75); }
+      }
+
+      .rowhead { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 3px; }
+      .rowhead .p { font-size: 11px; color: #fbbf24; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
       .card { position: fixed; width: 340px; max-width: calc(100vw - 24px); background: #0e0f13; color: #e7e8ea;
         border: 1px solid #2a2c33; border-radius: 14px; box-shadow: 0 16px 50px rgba(0,0,0,.5);
         pointer-events: auto; display: flex; flex-direction: column; overflow: hidden; }
@@ -1419,9 +1469,12 @@
       const d = thread.data || {};
       const card = document.createElement("div");
       card.className = "card";
-      const resolved = d.status === "resolved";
+      const st = d.status || "open";
+      const meta = getStatusMeta(st);
+      const resolved = st === "resolved";
       card.innerHTML = `<div class="head">
           <span class="t">${esc(d.createdBy?.name || "Thread")} · ${esc(timeAgo(d.createdAt?._ts))}</span>
+          <span class="stbadge ${meta.class}"><span class="stdot"></span>${meta.label}</span>
           <button class="res" title="${resolved ? "Reopen" : "Resolve"}">${svg(resolved ? "reopen" : "check", 14)}<span>${resolved ? "Reopen" : "Resolve"}</span></button>
           <button class="x">${svg("x", 14)}</button>
         </div>
@@ -1470,17 +1523,35 @@
     }
 
     /* ── pins ── */
+    function getStatusMeta(status) {
+      switch (status) {
+        case "in_progress":
+          return { key: "in_progress", label: "Agent fixing…", class: "st-in-progress" };
+        case "deploying":
+          return { key: "deploying", label: "Deploying…", class: "st-deploying" };
+        case "deployed":
+          return { key: "deployed", label: "Deployed · Ready to test", class: "st-deployed" };
+        case "resolved":
+          return { key: "resolved", label: "Resolved", class: "st-resolved" };
+        case "open":
+        default:
+          return { key: "open", label: "Open", class: "st-open" };
+      }
+    }
+
     function renderPins() {
       ui.pins.innerHTML = "";
       if (state.hidden) return;
       state.threads.forEach((t, i) => {
         const p = anchorPoint(t.data?.anchor);
+        const st = t.data?.status || "open";
+        const meta = getStatusMeta(st);
         const pin = document.createElement("button");
-        pin.className = "pinbtn";
+        pin.className = "pinbtn " + meta.class;
         pin.textContent = String(i + 1);
         pin.style.left = p.x + "px";
         pin.style.top = p.y + "px";
-        pin.title = t.data?.preview || "";
+        pin.title = "[" + meta.label + "] " + (t.data?.preview || "");
         pin.addEventListener("click", () => openThreadCard(t, p.x, p.y));
         ui.pins.appendChild(pin);
       });
@@ -1549,9 +1620,11 @@
         }
         list.forEach((t) => {
           const d = t.data || {};
+          const st = d.status || "open";
+          const meta = getStatusMeta(st);
           const b = document.createElement("button");
           b.className = "rowitem";
-          b.innerHTML = `<div class="p">${esc(d.path || "/")}</div>
+          b.innerHTML = `<div class="rowhead"><span class="p">${esc(d.path || "/")}</span><span class="stbadge ${meta.class}"><span class="stdot"></span>${meta.label}</span></div>
             <div class="s">${esc(d.preview || "")}</div>
             <div class="m">${esc(d.createdBy?.name || "")} · ${d.messageCount || 1} comment${(d.messageCount || 1) > 1 ? "s" : ""} · ${esc(timeAgo(d.lastActivityAt?._ts || d.createdAt?._ts))}</div>`;
           b.addEventListener("click", () => {
