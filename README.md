@@ -9,7 +9,7 @@ Visual feedback and autonomous bug-fixing toolbar for web applications. Drop pin
 - **Persistent Draft Caching**: Unposted comments, mentions, and annotated screenshots are continuously cached locally (localStorage) and auto-restored on reload or navigation.
 - **Synchronized Paired Drag**: Pins remain stable click targets when closed, and move in lockstep with the comment box when opened.
 - **Single-Permission Screen Capture**: Built-in screenshot and drawing tool captures tab frames without repeatedly asking for browser permissions.
-- **Live Progress Ring & Timer**: Active count badge features an animated circular progress ring and live elapsed seconds counter during agent fixes.
+- **Live Progress Ring & Timers**: Active count badge features an animated circular progress ring and live elapsed seconds counter, with individual real-time seconds tickers on every in-progress issue row in the drawer. Active count badge features an animated circular progress ring and live elapsed seconds counter during agent fixes.
 - **Autonomous Multi-Agent Collaboration**: AI agents detect claimed issues and automatically avoid modifying the same source files concurrently to prevent merge conflicts.
 - **Automatic Page Refresh**: Web pages automatically refresh when an issue is marked resolved.
 

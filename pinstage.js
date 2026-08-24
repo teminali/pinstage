@@ -1021,6 +1021,17 @@
 
       .stbadge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; font-size: 10.5px; font-weight: 700; border: 1px solid transparent; }
       .stbadge .stdot { width: 5px; height: 5px; border-radius: 999px; }
+      .stbadge .row-timer-sec {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 9.5px;
+        font-weight: 800;
+        padding: 1px 4px;
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.14);
+        margin-left: 3px;
+        letter-spacing: -0.02em;
+        line-height: 1;
+      }
       .stbadge.st-open { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
       .stbadge.st-open .stdot { background: #fbbf24; }
       .stbadge.st-in-progress { background: rgba(2, 132, 199, 0.18); color: #38bdf8; border-color: rgba(56, 189, 248, 0.4); }
@@ -1872,11 +1883,14 @@
       const card = document.createElement("div");
       card.className = "card";
       const st = d.status || "open";
-      const meta = getStatusMeta(st);
+      const startTime = (st === "in_progress" || st === "deploying")
+        ? (d.claimedBy?.claimedAt?._ts || d.lastActivityAt?._ts || d.createdAt?._ts || Date.now())
+        : null;
+      const meta = getStatusMeta(st, startTime);
       const resolved = st === "resolved";
       card.innerHTML = `<div class="head">
           <span class="t">${esc(d.createdBy?.name || "Thread")} · ${esc(timeAgo(d.createdAt?._ts))}</span>
-          <span class="stbadge ${meta.class}"><span class="stdot"></span>${meta.label}</span>
+          <span class="stbadge ${meta.class}" data-start-time="${startTime || ""}"><span class="stdot"></span>${meta.label}${meta.timerHtml}</span>
           <button class="res" title="${resolved ? "Reopen" : "Resolve"}">${svg(resolved ? "reopen" : "check", 14)}<span>${resolved ? "Reopen" : "Resolve"}</span></button>
           <button class="x">${svg("x", 14)}</button>
         </div>
@@ -1957,19 +1971,30 @@
     }
 
     /* ── pins ── */
-    function getStatusMeta(status) {
+    function getStatusMeta(status, startTime) {
+      const elapsed = startTime ? Math.max(0, Math.floor((Date.now() - startTime) / 1000)) : 0;
       switch (status) {
         case "in_progress":
-          return { key: "in_progress", label: "In Progress", class: "st-in-progress" };
+          return {
+            key: "in_progress",
+            label: "In Progress",
+            timerHtml: startTime ? ` <span class="row-timer-sec">${elapsed}s</span>` : "",
+            class: "st-in-progress" + (startTime ? " has-timer" : "")
+          };
         case "deploying":
-          return { key: "deploying", label: "Deploying…", class: "st-deploying" };
+          return {
+            key: "deploying",
+            label: "Deploying…",
+            timerHtml: startTime ? ` <span class="row-timer-sec">${elapsed}s</span>` : "",
+            class: "st-deploying" + (startTime ? " has-timer" : "")
+          };
         case "deployed":
-          return { key: "deployed", label: "Deployed", class: "st-deployed" };
+          return { key: "deployed", label: "Deployed", timerHtml: "", class: "st-deployed" };
         case "resolved":
-          return { key: "resolved", label: "Resolved", class: "st-resolved" };
+          return { key: "resolved", label: "Resolved", timerHtml: "", class: "st-resolved" };
         case "open":
         default:
-          return { key: "open", label: "Open", class: "st-open" };
+          return { key: "open", label: "Open", timerHtml: "", class: "st-open" };
       }
     }
 
@@ -2032,6 +2057,21 @@
       }
     });
 
+    
+    let inboxTickerTimer = null;
+    let cardTickerTimer = null;
+    function updateRowTimers(container) {
+      if (!container) return;
+      const timerBadges = container.querySelectorAll(".stbadge.has-timer");
+      timerBadges.forEach((badge) => {
+        const start = parseInt(badge.dataset.startTime, 10);
+        if (!start) return;
+        const elapsed = Math.max(0, Math.floor((Date.now() - start) / 1000));
+        const secEl = badge.querySelector(".row-timer-sec");
+        if (secEl) secEl.textContent = elapsed + "s";
+      });
+    }
+
     /* ── inbox ── */
     async function renderInbox() {
       closeCards();
@@ -2056,10 +2096,13 @@
         list.forEach((t) => {
           const d = t.data || {};
           const st = d.status || "open";
-          const meta = getStatusMeta(st);
+          const startTime = (st === "in_progress" || st === "deploying")
+            ? (d.claimedBy?.claimedAt?._ts || d.lastActivityAt?._ts || d.createdAt?._ts || Date.now())
+            : null;
+          const meta = getStatusMeta(st, startTime);
           const b = document.createElement("button");
           b.className = "rowitem";
-          b.innerHTML = `<div class="rowhead"><span class="p">${esc(d.path || "/")}</span><span class="stbadge ${meta.class}"><span class="stdot"></span>${meta.label}</span></div>
+          b.innerHTML = `<div class="rowhead"><span class="p">${esc(d.path || "/")}</span><span class="stbadge ${meta.class}" data-start-time="${startTime || ""}"><span class="stdot"></span>${meta.label}${meta.timerHtml}</span></div>
             <div class="s">${esc(d.preview || "")}</div>
             <div class="m">${esc(d.createdBy?.name || "")} · ${d.messageCount || 1} comment${(d.messageCount || 1) > 1 ? "s" : ""} · ${esc(timeAgo(d.lastActivityAt?._ts || d.createdAt?._ts))}</div>`;
           b.addEventListener("click", () => {
@@ -2079,6 +2122,12 @@
       tabs.forEach((b) => b.addEventListener("click", () => showTab(b.dataset.t)));
       ui.layer.appendChild(card);
       bindPairedDrag({ card });
+
+      if (inboxTickerTimer) { clearInterval(inboxTickerTimer); inboxTickerTimer = null; }
+      updateRowTimers(card);
+      inboxTickerTimer = setInterval(() => {
+        updateRowTimers(card);
+      }, 1000);
       state.activeInboxRefresher = (tab) => showTab(tab, true);
       state.activeInboxRefresher = async (tab) => {
         await showTab(tab || state.inboxTab || "open");
