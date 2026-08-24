@@ -731,8 +731,59 @@
 
     /* ── data flows on top of the adapter ── */
 
+    let knownActiveThreadIds = new Set();
+    let initialLoadDone = false;
+    let isReloading = false;
+
+    function triggerAutoReloadNotice(msg = "Issue resolved · Refreshing to apply updates…") {
+      if (isReloading) return;
+      isReloading = true;
+      const notice = document.createElement("div");
+      notice.className = "toast";
+      notice.style.position = "fixed";
+      notice.style.top = "18px";
+      notice.style.left = "50%";
+      notice.style.transform = "translateX(-50%)";
+      notice.style.background = "#059669";
+      notice.style.color = "#ffffff";
+      notice.style.padding = "10px 18px";
+      notice.style.borderRadius = "9999px";
+      notice.style.boxShadow = "0 8px 30px rgba(0,0,0,0.25)";
+      notice.style.fontWeight = "600";
+      notice.style.fontSize = "13px";
+      notice.style.display = "flex";
+      notice.style.alignItems = "center";
+      notice.style.gap = "8px";
+      notice.style.zIndex = "2147483647";
+      notice.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ffffff;animation:pinstage-pulse 1s infinite"></span>${esc(msg)}`;
+      ui.layer.appendChild(notice);
+      setTimeout(() => {
+        window.location.reload();
+      }, 700);
+    }
+
     async function loadThreadsForPage() {
-      state.threads = await adapter.listThreads({ project, path: state.pathname, status: "open" });
+      const prevIds = new Set(knownActiveThreadIds);
+      const fresh = await adapter.listThreads({ project, path: state.pathname, status: "open" });
+      state.threads = fresh;
+      const currentIds = new Set(fresh.map((t) => t.id));
+
+      if (initialLoadDone && prevIds.size > 0 && !isReloading) {
+        let hasResolved = false;
+        for (const oldId of prevIds) {
+          if (!currentIds.has(oldId)) {
+            hasResolved = true;
+            break;
+          }
+        }
+        if (hasResolved) {
+          triggerAutoReloadNotice("Issue fixed & resolved · Refreshing page…");
+          return;
+        }
+      }
+
+      knownActiveThreadIds = currentIds;
+      initialLoadDone = true;
       renderPins();
       renderBar();
     }
