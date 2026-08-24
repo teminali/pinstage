@@ -7,7 +7,7 @@ Ask the user which mode they want to run:
 - 🔄 **Auto Dev Mode (Continuous Autonomous Loop)**:
   - Continuously poll for newly reported issues across the project.
   - When an issue appears:
-    1. Set status to `in_progress` via `pinstage_set_status`.
+    1. ⚡ **MANDATORY FIRST STEP**: Immediately call `pinstage_set_status({ id, status: "in_progress" })` BEFORE reading files or editing code so the live UI badge turns blue and pulses.
     2. Call `pinstage_get_context` to get component, DOM element, testId, selector, and source file.
     3. Evaluate if it is a Major Issue (Staging only).
     4. Implement and verify the fix.

@@ -475,7 +475,7 @@ const TOOLS = [
   {
     name: "pinstage_list_issues",
     description:
-      "List Pinstage issue threads (comments pinned on the app by the team). Returns id, status (open, in_progress, deploying, deployed, resolved), project, page path, the element and source file the pin sits on, a diagnostics summary, preview, author, and activity. Default: active (non-resolved) issues.",
+      "List Pinstage issue threads. When you pick an issue to work on, you MUST immediately call pinstage_set_status with 'in_progress' before writing code or running build commands so the live UI badge pulses on the user's screen.",
     inputSchema: {
       type: "object",
       properties: {
@@ -548,7 +548,7 @@ const TOOLS = [
   {
     name: "pinstage_set_status",
     description:
-      "Update the live progress status of a Pinstage issue thread. Statuses: \x27in_progress\x27 (agent has begun working on the fix), \x27deploying\x27 (fix is building/deploying to staging), \x27deployed\x27 (fix is live on staging ready to test), \x27open\x27 (reset to open), or \x27resolved\x27 (verified and closed). Optionally posts a comment note.",
+      "MANDATORY FIRST STEP: Update issue status to 'in_progress' as soon as you start working on an issue. Statuses: 'in_progress' (agent coding fix - triggers blue pulse on UI), 'deploying' (building/deploying - triggers purple pulse), 'deployed' (live ready to test - emerald), 'open' (reset), or 'resolved' (verified & closed).",
     inputSchema: {
       type: "object",
       properties: {
