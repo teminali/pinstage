@@ -764,9 +764,18 @@
 
     async function loadThreadsForPage() {
       const prevIds = new Set(knownActiveThreadIds);
-      const fresh = await adapter.listThreads({ project, path: state.pathname, status: "open" });
-      state.threads = fresh;
-      const currentIds = new Set(fresh.map((t) => t.id));
+      const allActive = await adapter.listThreads({ project, status: "open" });
+      
+      const norm = (p) => (p || "/").replace(/^\/(en|sw)(\/|$)/, "/").replace(/\/$/, "");
+      const curPathNorm = norm(state.pathname);
+
+      state.threads = allActive.filter((t) => {
+        const tPathNorm = norm(t.data?.path);
+        return tPathNorm === curPathNorm || (t.data?.path === state.pathname);
+      });
+      state.allActiveThreads = allActive;
+
+      const currentIds = new Set(state.threads.map((t) => t.id));
 
       if (initialLoadDone && prevIds.size > 0 && !isReloading) {
         let hasResolved = false;
@@ -976,6 +985,12 @@
         border: 1px solid rgba(192, 132, 252, 0.5);
         color: #c084fc;
         box-shadow: 0 0 12px rgba(147, 51, 234, 0.4);
+      }
+      .bar .badge.is-deployed {
+        background: #062e22;
+        border: 1px solid rgba(52, 211, 153, 0.5);
+        color: #34d399;
+        box-shadow: 0 0 10px rgba(16, 185, 129, 0.35);
       }
       .bar .badge .timer-ring {
         display: block;
@@ -2212,12 +2227,18 @@
       comment.addEventListener("click", () => setMode(state.mode === "comment" ? "idle" : "comment"));
       bar.appendChild(comment);
 
-      const hasWorking = state.threads.some((t) => t.data?.status === "in_progress" || t.data?.status === "deploying");
-      const hasDeploying = state.threads.some((t) => t.data?.status === "deploying");
-      const badgeCls = "badge" + (hasDeploying ? " is-deploying" : hasWorking ? " is-working" : "");
+      const allActive = state.allActiveThreads || state.threads;
+      const hasWorking = allActive.some((t) => t.data?.status === "in_progress" || t.data?.status === "deploying");
+      const hasDeploying = allActive.some((t) => t.data?.status === "deploying");
+      const hasDeployed = allActive.some((t) => t.data?.status === "deployed");
+
+      let badgeCls = "badge";
+      if (hasDeploying) badgeCls += " is-deploying";
+      else if (hasWorking) badgeCls += " is-working";
+      else if (hasDeployed) badgeCls += " is-deployed";
 
       let badgeHTML = "";
-      if (state.threads.length) {
+      if (allActive.length) {
         if (hasWorking) {
           const isDeploying = !!hasDeploying;
           const strokeColor = isDeploying ? "#c084fc" : "#38bdf8";
@@ -2229,7 +2250,7 @@
             <span class="timer-sec">0s</span>
           </span>`;
         } else {
-          badgeHTML = `<span class="${badgeCls}">${state.threads.length}</span>`;
+          badgeHTML = `<span class="${badgeCls}">${allActive.length}</span>`;
         }
       }
 
@@ -2254,8 +2275,8 @@
       if (badgeTickerTimer) { clearInterval(badgeTickerTimer); badgeTickerTimer = null; }
       if (hasWorking) {
         const badgeEl = bar.querySelector(".badge.has-timer");
-        const activeThread = state.threads.find((t) => t.data?.status === "deploying") ||
-                            state.threads.find((t) => t.data?.status === "in_progress");
+        const activeThread = allActive.find((t) => t.data?.status === "deploying") ||
+                            allActive.find((t) => t.data?.status === "in_progress");
         const startTime = activeThread?.data?.lastActivityAt?._ts ||
                           activeThread?.data?.createdAt?._ts ||
                           Date.now();
