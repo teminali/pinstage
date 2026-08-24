@@ -1,12 +1,12 @@
 -- ═══════════════════════════════════════════════════════════════════════════
---  pinstage — example Supabase schema for the built-in supabaseAdapter
+--  pinstage - example Supabase schema for the built-in supabaseAdapter
 --
 --  Storage convention: id TEXT PRIMARY KEY + data JSONB. Adapt names/paths to
 --  your project (the adapter's `tables` option maps custom names).
 --
 --  Two helpers you must provide from YOUR auth model:
---    app_uid()   — the signed-in user's application uid (below: JWT sub)
---    is_admin()  — whether they are a platform admin (below: a stub)
+--    app_uid()   - the signed-in user's application uid (below: JWT sub)
+--    is_admin()  - whether they are a platform admin (below: a stub)
 -- ═══════════════════════════════════════════════════════════════════════════
 
 CREATE OR REPLACE FUNCTION app_uid() RETURNS text

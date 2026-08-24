@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 /* ═══════════════════════════════════════════════════════════════════════════
- * pinstage-mcp — an MCP server that lets AI coding agents work your
- * Pinstage issue queue (github.com/teminali/pinstage) as native tools.
+ * pinstage-mcp: an MCP server for the Pinstage issue queue
+ * https://github.com/teminali/pinstage
+ * v0.4.1 · MIT © Teminali
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- * Claude Code, Codex, or any MCP client can list open issues, read a full
- * thread (with screenshot URLs), reply, resolve, and reopen — the loop
- * becomes: teammate pins an issue on staging → the agent reads it → fixes the
- * code → replies + resolves → redeploys. No REST glue, no scripts.
+ * Lets AI coding agents (Claude Code, Codex, any MCP client) work Pinstage
+ * issues as native tools: list the queue, read a full thread with screenshot
+ * URLs, reply, resolve, reopen, and mirror everything to GitHub Issues.
+ * The loop: a teammate pins an issue on staging, the agent reads it, fixes
+ * the code, replies and resolves, redeploys.
  *
  * Zero dependencies. Speaks MCP over stdio (newline-delimited JSON-RPC).
  *
@@ -14,17 +17,19 @@
  *   claude mcp add pinstage -- node /path/to/pinstage-mcp.mjs \
  *     --env-file /path/to/your-app/.env.local
  *
- *   …or with explicit env:
- *     PINSTAGE_SUPABASE_URL=https://<ref>.supabase.co \
- *     PINSTAGE_SERVICE_KEY=<service role key> \
- *     claude mcp add pinstage -- node /path/to/pinstage-mcp.mjs
+ * CLI MODE (cron / CI, no MCP client needed):
+ *   node pinstage-mcp.mjs sync-github --env-file /path/to/.env.local
  *
- * CONFIG (env, or KEY=VALUE lines in the --env-file):
- *   PINSTAGE_SUPABASE_URL   (falls back to NEXT_PUBLIC_SUPABASE_URL)
- *   PINSTAGE_SERVICE_KEY    (falls back to SUPABASE_SERVICE_ROLE_KEY)
- *   PINSTAGE_PROJECT        optional default project filter
- *   PINSTAGE_AUTHOR_NAME    name stamped on replies (default "AI Agent")
- *   PINSTAGE_TABLE_THREADS / PINSTAGE_TABLE_COMMENTS  table overrides
+ * CONFIG (environment variables, or KEY=VALUE lines in the --env-file):
+ *   PINSTAGE_SUPABASE_URL    falls back to NEXT_PUBLIC_SUPABASE_URL
+ *   PINSTAGE_SERVICE_KEY     falls back to SUPABASE_SERVICE_ROLE_KEY
+ *   PINSTAGE_PROJECT         optional default project filter
+ *   PINSTAGE_AUTHOR_NAME     name stamped on replies (default "AI Agent")
+ *   PINSTAGE_TABLE_THREADS   table override (default "feedbackThreads")
+ *   PINSTAGE_TABLE_COMMENTS  table override (default "feedbackComments")
+ *   PINSTAGE_GITHUB_REPO     "owner/repo" for the GitHub Issues mirror
+ *   PINSTAGE_GITHUB_TOKEN    falls back to GITHUB_TOKEN, then `gh auth token`
+ *   PINSTAGE_APP_URL         app origin, used for deep links in issue bodies
  *
  * The service-role key never leaves this process; the agent only sees tool
  * results. Point the env-file at the same .env.local your app already uses.
@@ -85,7 +90,7 @@ async function rest(path, init = {}) {
     headers: { ...HEADERS, ...init.headers },
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-  // Prefer: return=minimal answers 201/204 with an EMPTY body — parse text,
+  // Prefer: return=minimal answers 201/204 with an EMPTY body - parse text,
   // never res.json() blindly, or inserts crash after succeeding.
   const text = await res.text();
   return text ? JSON.parse(text) : null;
@@ -129,7 +134,7 @@ function threadLine({ id, data: d }) {
   return [
     `[${d.status}] ${id}`,
     `  ${d.project ?? "?"} ${d.path ?? "?"}${d.query ?? ""}  (v${d.appVersion ?? "?"}, ${d.viewport ?? "?"})`,
-    `  "${d.preview ?? ""}" — ${d.createdBy?.name ?? "?"}, opened ${when(d.createdAt)}, ${d.messageCount ?? 1} comment(s)` +
+    `  "${d.preview ?? ""}" - ${d.createdBy?.name ?? "?"}, opened ${when(d.createdAt)}, ${d.messageCount ?? 1} comment(s)` +
       (d.resolvedBy ? `, resolved by ${d.resolvedBy.name} ${when(d.resolvedAt)}` : ""),
   ].join("\n");
 }
@@ -190,7 +195,7 @@ async function syncGithub(repo = GH_REPO) {
     if (!g) {
       const meta = [
         `**Page:** \`${d.path ?? "?"}${d.query ?? ""}\``,
-        `**Reported by:** ${d.createdBy?.name ?? "?"} — ${when(d.createdAt)}`,
+        `**Reported by:** ${d.createdBy?.name ?? "?"} - ${when(d.createdAt)}`,
         `**Build:** v${d.appVersion ?? "?"} · ${d.viewport ?? "?"}`,
       ];
       if (APP_URL) {
@@ -347,7 +352,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "owner/repo" + (GH_REPO ? ` (default ${GH_REPO})` : " (required — no PINSTAGE_GITHUB_REPO configured)") },
+        repo: { type: "string", description: "owner/repo" + (GH_REPO ? ` (default ${GH_REPO})` : " (required - no PINSTAGE_GITHUB_REPO configured)") },
       },
     },
     handler: async ({ repo }) => syncGithub(repo || GH_REPO),
@@ -380,7 +385,7 @@ rl.on("line", async (line) => {
   try {
     msg = JSON.parse(line);
   } catch {
-    return; // not JSON — ignore
+    return; // not JSON - ignore
   }
   const { id, method, params } = msg;
 
@@ -389,7 +394,7 @@ rl.on("line", async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "pinstage-mcp", version: "0.4.0" },
+        serverInfo: { name: "pinstage-mcp", version: "0.4.1" },
       });
     } else if (method === "notifications/initialized" || method?.startsWith("notifications/")) {
       // notifications need no response

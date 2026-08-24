@@ -1,23 +1,22 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Pinstage — pin comments on your staging environment
- * https://github.com/teminali/pinstage · MIT © Teminali
- * v0.2.2
+ * Pinstage: pin comments on your staging environment
+ * https://github.com/teminali/pinstage
+ * v0.4.1 · MIT © Teminali
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Figma/Vercel-style pinned comment threads for your STAGING environment:
- * your team clicks anywhere on a page, leaves a comment (with annotated
- * screenshots), @mentions teammates — and every thread is equally readable by
- * your admin dashboard, scripts, or CI, because Pinstage owns no data store
- * of its own.
+ * A Figma-style comment layer for your own product. Team members click
+ * anywhere on a page, pin a thread there, attach annotated screenshots, and
+ * @mention teammates. Every thread is equally readable by your admin
+ * dashboard, scripts, CI, or an AI agent (see mcp/pinstage-mcp.mjs), because
+ * Pinstage owns no data store of its own.
  *
- * ARCHITECTURE — core + adapter:
- *   The UI core talks to a small ADAPTER interface. Ship the built-in
- *   Supabase adapter, or implement ~9 methods against any backend (REST,
- *   GraphQL, Firebase…) and the toolbar works unchanged. Your dashboard
- *   integrates by reading the same store the adapter writes.
+ * ARCHITECTURE
+ *   The UI core talks to a small ADAPTER interface. Use the built-in
+ *   Supabase adapter, or implement these methods against any backend and the
+ *   toolbar works unchanged:
  *
  *   adapter = {
- *     getIdentity():            Promise<{uid,name,email}|null>   // null → toolbar stays invisible
+ *     getIdentity():            Promise<{uid,name,email}|null>   // null: toolbar stays invisible
  *     listTeam():               Promise<[{uid,name,email,role}]> // @mention picker
  *     listThreads({project, path?, status}): Promise<[{id,data}]>
  *     getThread(id):            Promise<{id,data}|null>
@@ -26,10 +25,10 @@
  *     listComments(threadId):   Promise<[{id,data}]>
  *     addComment({id,data}):    Promise<void>
  *     notifyMentions?(payload): Promise<void>                    // optional
- *     uploadAttachment?(blob, {threadId}): Promise<{url}>        // optional — enables screenshots
+ *     uploadAttachment?(blob, {threadId}): Promise<{url}>        // optional, enables screenshots
  *   }
  *
- * QUICK START (Supabase backend — see examples/schema.supabase.sql):
+ * QUICK START (Supabase backend, schema in examples/schema.supabase.sql):
  *
  *   <script src="/toolbar/pinstage.js"></script>
  *   <script>
@@ -43,18 +42,14 @@
  *     });
  *   </script>
  *
- * SCREENSHOTS: the composer's camera button captures the current tab via the
- * browser's native getDisplayMedia (no libraries, pixel-perfect), then opens
- * a built-in annotation editor — crop, pen, rectangle, arrow, three ink
- * colors, undo — before attaching. Images can also be pasted straight into
- * the composer or picked from disk. Uploads go through
- * adapter.uploadAttachment; without that method the buttons don't render.
+ * The HOST decides where this runs. Load the script on staging only, or on
+ * production with startHidden: true for a quiet toolbar that shows nothing
+ * until the user expands it. All writes go through your backend's row-level
+ * security with the user's own token. Pinstage is UI, not a security
+ * boundary.
  *
- * The HOST decides where this runs (load the script on staging only). All
- * writes go through your backend's row-level security with the user's own
- * token — Pinstage is UI, not a security boundary.
- *
- * Zero dependencies. All UI lives in a shadow root; icons are inline SVG.
+ * Zero dependencies. One file, no build step. UI lives in a shadow root so
+ * host CSS and toolbar CSS cannot touch each other. Icons are inline SVG.
  * ═══════════════════════════════════════════════════════════════════════════ */
 (function () {
   "use strict";
@@ -98,8 +93,9 @@
 
   function decodeJwt(token) {
     try {
-      const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-      return JSON.parse(decodeURIComponent(escape(atob(payload))));
+      const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      return JSON.parse(new TextDecoder().decode(bytes));
     } catch {
       return null;
     }
@@ -108,7 +104,6 @@
   /* ── inline SVG icon set (stroke style, currentColor) ───────────────────── */
 
   const I = {
-    pin: '<path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
     comment: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
     inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
     minus: '<path d="M5 12h14"/>',
@@ -127,7 +122,7 @@
   const svg = (name, size = 16) =>
     `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[name]}</svg>`;
 
-  /* The Pinstage mark (see assets/logo.svg) — amber pin, white bubble.
+  /* The Pinstage mark (see assets/logo.svg) - amber pin, white bubble.
    * Literal colors on purpose: this is the brand, not a themable glyph. */
   const logo = (size = 16) =>
     `<svg width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true">` +
@@ -136,7 +131,7 @@
     `<path fill="#fff" d="M10.3 12.9 8.9 14.4l.5-2.6z"/>` +
     `</svg>`;
 
-  /* Selector for the element under a click — stable-ish across renders:
+  /* Selector for the element under a click - stable-ish across renders:
    * prefer the nearest #id ancestor, else a short tag:nth-of-type chain. */
   function cssPath(el) {
     if (!(el instanceof Element)) return "body";
@@ -167,16 +162,16 @@
    * Pinstage.supabaseAdapter(options)
    *
    * options:
-   *   url, anonKey            — the Supabase project
-   *   getToken()              — async, returns the signed-in user's JWT (or null)
-   *   tables?                 — { team, threads, comments, notifications } name overrides
-   *   uidFromClaims?(claims)  — where your app's uid lives in the JWT
+   *   url, anonKey            - the Supabase project
+   *   getToken()              - async, returns the signed-in user's JWT (or null)
+   *   tables?                 - { team, threads, comments, notifications } name overrides
+   *   uidFromClaims?(claims)  - where your app's uid lives in the JWT
    *                             (default: app_metadata.firebase_uid ?? sub)
-   *   adminSelfRegister?      — { usersTable, roleSelect, nameSelect, adminRole }
+   *   adminSelfRegister?      - { usersTable, roleSelect, nameSelect, adminRole }
    *                             lets platform admins auto-join the team roster
    *                             on first use. Off unless provided.
-   *   mentionType?            — notification `type` value (default "md_toolbar_mention")
-   *   storage?                — { bucket: "uploads", prefix: "pinstage" }: the
+   *   mentionType?            - notification `type` value (default "md_toolbar_mention")
+   *   storage?                - { bucket: "uploads", prefix: "pinstage" }: the
    *                             PUBLIC Supabase Storage bucket screenshots
    *                             upload to (authenticated insert policy
    *                             required). Set storage: false to disable
@@ -358,7 +353,7 @@
 
     /* Production-friendly quiet mode: with startHidden true the toolbar
      * boots as the small dot and pins stay off the page until the user
-     * expands it — comments never "float around" for someone who didn't ask.
+     * expands it - comments never "float around" for someone who didn't ask.
      * The choice is remembered per user per project. */
     const HIDE_KEY = "pinstage:" + project + ":hidden";
     const storedHidden = (() => {
@@ -513,7 +508,7 @@
             const r = el.getBoundingClientRect();
             if (r.width || r.height) return { x: r.left + r.width * (a.relX ?? 0.5), y: r.top + r.height * (a.relY ?? 0.5) };
           }
-        } catch { /* bad selector — fall through */ }
+        } catch { /* bad selector - fall through */ }
       }
       const de = document.documentElement;
       return {
@@ -627,7 +622,7 @@
       bar: document.createElement("div"),
       pins: document.createElement("div"),
       layer: document.createElement("div"),
-      top: document.createElement("div"), // editor / lightbox — above cards
+      top: document.createElement("div"), // editor / lightbox - above cards
     };
     root.appendChild(ui.pins);
     root.appendChild(ui.layer);
@@ -794,8 +789,7 @@
           b.innerHTML = svg(name);
           b.title = tip;
           b.addEventListener("click", () => {
-            tool = name === "square" || name === "arrow" || name === "crop" ? name : "pen";
-            tool = name; // pen/square/arrow/crop share their icon names
+            tool = name;
             tools.querySelectorAll("button[data-tool]").forEach((x) => x.classList.toggle("on", x === b));
           });
           b.dataset.tool = name;
@@ -1189,7 +1183,7 @@
         const list = await adapter.listThreads({ project, status: tab });
         rowsBox.innerHTML = "";
         if (!list.length) {
-          rowsBox.innerHTML = `<div class="empty">${tab === "open" ? "Nothing open — nice." : "Nothing resolved yet."}</div>`;
+          rowsBox.innerHTML = `<div class="empty">${tab === "open" ? "Nothing open - nice." : "Nothing resolved yet."}</div>`;
           return;
         }
         list.forEach((t) => {
@@ -1301,7 +1295,7 @@
     (async () => {
       try {
         state.me = await adapter.getIdentity();
-        if (!state.me) return; // not on the team — stay invisible
+        if (!state.me) return; // not on the team - stay invisible
         state.team = await adapter.listTeam();
         document.body.appendChild(host);
         renderBar();
@@ -1315,6 +1309,4 @@
   }
 
   window.Pinstage = { init, supabaseAdapter };
-  // Back-compat with the pre-rename global.
-  window.MDToolbar = window.Pinstage;
 })();
