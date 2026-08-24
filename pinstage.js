@@ -957,7 +957,11 @@
       .card { position: fixed; width: 340px; max-width: calc(100vw - 24px); background: #0e0f13; color: #e7e8ea;
         border: 1px solid #2a2c33; border-radius: 14px; box-shadow: 0 16px 50px rgba(0,0,0,.5);
         pointer-events: auto; display: flex; flex-direction: column; overflow: hidden; }
-      .card .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #22242b; }
+      .card .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #22242b; cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
+      .card .head:active { cursor: grabbing; }
+      .card .head .t { font-size: 12.5px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+      .card .head .av { pointer-events: none; }
+      .card .head .stbadge { pointer-events: none; }
       .card .head .t { font-size: 12.5px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .card .head button { color: #8b8e98; font-size: 12px; padding: 4px 8px; border-radius: 8px; }
       .card .head button:hover { background: #1c1e24; color: #fff; }
@@ -1434,79 +1438,114 @@
       if (!head) return;
       head.style.cursor = "grab";
       head.style.userSelect = "none";
+      head.style.touchAction = "none";
 
-      head.addEventListener("pointerdown", (e) => {
-        if (e.target.closest("button, input, textarea, a, select")) return;
+      let dragging = false;
+      let startX = 0;
+      let startY = 0;
+      let initLeft = 0;
+      let initTop = 0;
+
+      const onPointerDown = (e) => {
+        if (e.target && e.target.closest("button, input, textarea, a, select")) return;
+        dragging = true;
         head.style.cursor = "grabbing";
-        const startX = e.clientX;
-        const startY = e.clientY;
+        startX = e.clientX;
+        startY = e.clientY;
         const rect = card.getBoundingClientRect();
-        const initLeft = rect.left;
-        const initTop = rect.top;
+        initLeft = rect.left;
+        initTop = rect.top;
+        try { head.setPointerCapture(e.pointerId); } catch {}
+        e.preventDefault();
+      };
 
-        const onMove = (moveEv) => {
-          const dx = moveEv.clientX - startX;
-          const dy = moveEv.clientY - startY;
-          const w = card.offsetWidth || 340;
-          const h = card.offsetHeight || 300;
-          const maxLeft = Math.max(8, window.innerWidth - w - 8);
-          const maxTop = Math.max(8, window.innerHeight - h - 8);
-          const newLeft = Math.min(Math.max(8, initLeft + dx), maxLeft);
-          const newTop = Math.min(Math.max(8, initTop + dy), maxTop);
-          card.style.left = newLeft + "px";
-          card.style.top = newTop + "px";
-        };
+      const onPointerMove = (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        const w = card.offsetWidth || 340;
+        const h = card.offsetHeight || 200;
+        const maxLeft = Math.max(8, window.innerWidth - w - 8);
+        const maxTop = Math.max(8, window.innerHeight - h - 8);
+        const newLeft = Math.min(Math.max(8, initLeft + dx), maxLeft);
+        const newTop = Math.min(Math.max(8, initTop + dy), maxTop);
+        card.style.left = newLeft + "px";
+        card.style.top = newTop + "px";
+        card.style.right = "auto";
+        card.style.bottom = "auto";
+      };
 
-        const onUp = () => {
-          head.style.cursor = "grab";
-          removeEventListener("pointermove", onMove);
-          removeEventListener("pointerup", onUp);
-        };
+      const onPointerUp = (e) => {
+        if (!dragging) return;
+        dragging = false;
+        head.style.cursor = "grab";
+        try { head.releasePointerCapture(e.pointerId); } catch {}
+      };
 
-        addEventListener("pointermove", onMove);
-        addEventListener("pointerup", onUp);
-      });
+      head.addEventListener("pointerdown", onPointerDown);
+      head.addEventListener("pointermove", onPointerMove);
+      head.addEventListener("pointerup", onPointerUp);
+      head.addEventListener("pointercancel", onPointerUp);
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
     }
 
     function makePinDraggable(pin, onDrop, onClick) {
       pin.style.cursor = "grab";
       pin.style.touchAction = "none";
+      pin.style.userSelect = "none";
 
-      pin.addEventListener("pointerdown", (e) => {
+      let dragging = false;
+      let startX = 0;
+      let startY = 0;
+      let pX = 0;
+      let pY = 0;
+      let hasMoved = false;
+
+      const onPointerDown = (e) => {
         e.stopPropagation();
+        e.preventDefault();
+        dragging = true;
+        hasMoved = false;
+        startX = e.clientX;
+        startY = e.clientY;
+        pX = parseFloat(pin.style.left) || startX;
+        pY = parseFloat(pin.style.top) || startY;
         pin.style.cursor = "grabbing";
-        const startX = e.clientX;
-        const startY = e.clientY;
-        const pX = parseFloat(pin.style.left) || startX;
-        const pY = parseFloat(pin.style.top) || startY;
-        let hasMoved = false;
+        try { pin.setPointerCapture(e.pointerId); } catch {}
+      };
 
-        const onMove = (moveEv) => {
-          const dx = moveEv.clientX - startX;
-          const dy = moveEv.clientY - startY;
-          if (!hasMoved && Math.hypot(dx, dy) > 4) {
-            hasMoved = true;
-          }
-          if (hasMoved) {
-            pin.style.left = (pX + dx) + "px";
-            pin.style.top = (pY + dy) + "px";
-          }
-        };
+      const onPointerMove = (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        if (!hasMoved && Math.hypot(dx, dy) > 4) {
+          hasMoved = true;
+        }
+        if (hasMoved) {
+          pin.style.left = (pX + dx) + "px";
+          pin.style.top = (pY + dy) + "px";
+        }
+      };
 
-        const onUp = async (upEv) => {
-          pin.style.cursor = "grab";
-          removeEventListener("pointermove", onMove);
-          removeEventListener("pointerup", onUp);
-          if (!hasMoved) {
-            if (onClick) onClick(upEv);
-          } else {
-            if (onDrop) await onDrop(upEv.clientX, upEv.clientY);
-          }
-        };
+      const onPointerUp = async (e) => {
+        if (!dragging) return;
+        dragging = false;
+        pin.style.cursor = "grab";
+        try { pin.releasePointerCapture(e.pointerId); } catch {}
+        if (!hasMoved) {
+          if (onClick) onClick(e);
+        } else {
+          if (onDrop) await onDrop(e.clientX, e.clientY);
+        }
+      };
 
-        addEventListener("pointermove", onMove);
-        addEventListener("pointerup", onUp);
-      });
+      pin.addEventListener("pointerdown", onPointerDown);
+      pin.addEventListener("pointermove", onPointerMove);
+      pin.addEventListener("pointerup", onPointerUp);
+      pin.addEventListener("pointercancel", onPointerUp);
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
     }
 
     function placeCard(card, x, y) {
