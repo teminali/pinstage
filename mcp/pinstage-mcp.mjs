@@ -285,11 +285,42 @@ function diagnosticsBlock(d) {
   return out;
 }
 
+
+/* ── smart multi-agent conflict avoidance ────────────────────────────────── */
+
+function targetSignature(d) {
+  const src = sourceRef(d?.context?.source);
+  if (src) return src.split(":")[0];
+  if (d?.context?.component) return "<" + d.context.component + ">";
+  if (d?.context?.element?.testId) return "[data-testid='" + d.context.element.testId + "']";
+  if (d?.path) return d.path;
+  return "global";
+}
+
 /* withContext: the list view wants the element and source inline; the detail
  * view suppresses them because the full Context block follows. */
-function threadLine({ id, data: d }, withContext = true) {
+function threadLine({ id, data: d }, withContext = true, lockedSignatures = new Map()) {
+  const sig = targetSignature(d);
+  let statusHeader = `[${d.status}]`;
+  let safetyTag = "";
+
+  if (d.status === "in_progress") {
+    statusHeader = `[🔵 IN PROGRESS - Claimed by ${d.claimedBy?.author || "Agent"}]`;
+  } else if (d.status === "deploying") {
+    statusHeader = `[🟣 DEPLOYING - Building staging by ${d.claimedBy?.author || "Agent"}]`;
+  } else if (d.status === "deployed") {
+    statusHeader = `[🟢 DEPLOYED - Ready to verify]`;
+  } else if (d.status === "open") {
+    if (lockedSignatures.has(sig)) {
+      const locker = lockedSignatures.get(sig);
+      safetyTag = `\n  ⚠️ [CONFLICT LOCK — WAITING ON ACTIVE FIX on ${sig}]\n     Another agent is currently modifying ${sig} for issue ${locker.id}. Skip this to avoid merge/code overwrite conflicts.`;
+    } else {
+      safetyTag = `\n  ✅ [SAFE TO CLAIM — NO CONFLICT] (Target: ${sig})`;
+    }
+  }
+
   const lines = [
-    `[${d.status}] ${id}`,
+    `${statusHeader} ${id}${safetyTag}`,
     `  ${d.project ?? "?"} ${d.path ?? "?"}${d.query ?? ""}  ([${d.environment || "staging"}] v${d.appVersion ?? "?"}, ${d.viewport ?? "?"})`,
   ];
   if (withContext) {
@@ -497,8 +528,33 @@ const TOOLS = [
       if (project) q += `&data->>project=eq.${encodeURIComponent(project)}`;
       const rows = (await rest(q)).sort((a, b) => activity(b.data) - activity(a.data));
       if (!rows.length) return `No ${status === "all" ? "" : status + " "}issues.`;
-      // not rows.map(threadLine): map would pass the index as withContext
-      return rows.map((r) => threadLine(r)).join("\n\n") + "\n\nUse pinstage_get_context or pinstage_get_issue for the full thread.";
+
+      // Build locked file signatures map from active in_progress / deploying threads
+      const lockedSignatures = new Map();
+      rows.forEach((r) => {
+        const st = r.data?.status;
+        if (st === "in_progress" || st === "deploying") {
+          const sig = targetSignature(r.data);
+          if (sig && sig !== "global") {
+            lockedSignatures.set(sig, { id: r.id, author: r.data?.claimedBy?.author || "Another agent" });
+          }
+        }
+      });
+
+      const protocolHeader = [
+        "══════════════════════════════════════════════════════════════════════════════════",
+        "🤖 PINSTAGE SMART MULTI-AGENT COLLABORATION PROTOCOL:",
+        "• Pick a [SAFE TO CLAIM — NO CONFLICT] issue (marked ✅).",
+        "• NEVER pick [CONFLICT LOCK] issues (marked ⚠️) while another agent is working on the same file.",
+        "• ⚡ MANDATORY STEP 1: Immediately call pinstage_set_status({ id: \"<ID>\", status: \"in_progress\" })",
+        "  BEFORE reading files or writing code. (Activates live progress ring & claims the file lock).",
+        "• STAGING GUARD: For staging issues, evaluate if changes are Major (DB/Auth/Billing). If major, flag and await approval.",
+        "• LIFECYCLE: in_progress -> deploying (staging build) -> deployed (verify) -> resolved.",
+        "══════════════════════════════════════════════════════════════════════════════════",
+        "",
+      ].join("\n");
+
+      return protocolHeader + rows.map((r) => threadLine(r, true, lockedSignatures)).join("\n\n") + "\n\nUse pinstage_get_context or pinstage_get_issue for the full thread.";
     },
   },
   {
