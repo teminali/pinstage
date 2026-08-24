@@ -1,0 +1,14 @@
+{
+  "name": "md-toolbar",
+  "version": "0.1.0",
+  "description": "Figma/Vercel-style staging toolbar for your own product — pinned comment threads, @mentions, team-gated, backend-agnostic via a small adapter interface. One file, zero dependencies.",
+  "main": "md-toolbar.js",
+  "files": ["md-toolbar.js", "examples"],
+  "keywords": ["staging", "feedback", "comments", "toolbar", "preview", "review", "annotations"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teminali/md-toolbar.git"
+  },
+  "author": "Muhasibu Digital",
+  "license": "MIT"
+}
