@@ -18,6 +18,31 @@ The whole workflow, end to end:
 4. The agent replies with what it changed and calls `pinstage_resolve`.
 5. The teammate re-checks on staging and reopens the thread if needed.
 
+## Agent Operating Modes & Protocol
+
+When an AI coding assistant connects to Pinstage, it operates across 3 standardized modes:
+
+1. 🔄 **Auto Dev Mode (Continuous Autonomous Loop)**:
+   - Polls for newly reported issues across the project.
+   - Sets status to `in_progress` via `pinstage_set_status`.
+   - Locates exact DOM element and source file with `pinstage_get_context`.
+   - Implements and verifies the fix.
+   - **Environment Branching**:
+     - If reported on **Staging**: sets status `deploying` ➔ deploys to staging ➔ sets status `deployed` ➔ resolves.
+     - If reported on **Dev (localhost)**: sets status `deployed` ➔ resolves without triggering staging builds.
+   - Loops continuously until stopped by developer.
+
+2. 📦 **Fix Existing Issues & Stop**:
+   - Lists active open issues.
+   - Fixes and resolves issues in sequence (or smart staging batches) and stops.
+
+3. 🎯 **Fix Specific Issues**:
+   - Presents issue queue for the developer to pick which issue(s) to fix.
+
+### Major Staging Issue Safety Guard
+- **High Threshold**: Database schema migrations, security/RLS changes, payment processing alterations, or destructive data operations.
+- **Protocol**: Major issues are flagged (`[⚠️ Flagged: Major change — awaiting developer review]`), and the agent presents the implementation plan in chat and waits for explicit developer review before executing. Routine UI/UX, styling, and component bugs proceed automatically.
+
 ## Why the context matters
 
 A pin without context costs an agent a screenshot fetch (an image is roughly
