@@ -1382,8 +1382,91 @@
       ui.top.appendChild(lb);
     }
 
+    /* ── draft & asset persistence engine ── */
+    const DRAFT_KEY_PREFIX = "ps_draft_v2_";
+    function getDraftKey(scope = "new") {
+      return DRAFT_KEY_PREFIX + project + "_" + scope + "_" + (state.pathname || "/");
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function dataUrlToBlob(dataUrl) {
+      try {
+        const arr = dataUrl.split(",");
+        const mime = arr[0].match(/:(.*?);/)[1];
+        const bstr = atob(arr[1]);
+        let n = bstr.length;
+        const u8arr = new Uint8Array(n);
+        while (n--) {
+          u8arr[n] = bstr.charCodeAt(n);
+        }
+        return new Blob([u8arr], { type: mime });
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function persistDraft(scope, payload) {
+      try {
+        const key = getDraftKey(scope);
+        const attsSerialized = [];
+        if (payload.atts && payload.atts.length) {
+          for (const a of payload.atts) {
+            if (a.blob) {
+              const dataUrl = await blobToDataUrl(a.blob);
+              attsSerialized.push({ dataUrl, w: a.w, h: a.h });
+            } else if (a.dataUrl) {
+              attsSerialized.push({ dataUrl: a.dataUrl, w: a.w, h: a.h });
+            }
+          }
+        }
+        const data = {
+          body: payload.body || "",
+          mentions: payload.mentions || [],
+          anchor: payload.anchor || null,
+          context: payload.context || null,
+          x: payload.x || 0,
+          y: payload.y || 0,
+          atts: attsSerialized,
+          ts: Date.now(),
+        };
+        localStorage.setItem(key, JSON.stringify(data));
+      } catch (e) {
+        console.debug("[pinstage] draft save error:", e.message);
+      }
+    }
+
+    function readDraft(scope) {
+      try {
+        const key = getDraftKey(scope);
+        const raw = localStorage.getItem(key);
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        if (Date.now() - (data.ts || 0) > 86400000) {
+          localStorage.removeItem(key);
+          return null;
+        }
+        return data;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function purgeDraft(scope) {
+      try {
+        const key = getDraftKey(scope);
+        localStorage.removeItem(key);
+      } catch (e) {}
+    }
+
     /* ── mention-aware composer with attachments ── */
-    function buildComposer(placeholder, onSubmit) {
+    function buildComposer(placeholder, onSubmit, draftScope, initialDraft, onDraftChange) {
       const wrap = document.createElement("div");
       wrap.className = "compose";
       wrap.innerHTML = `
@@ -1402,7 +1485,14 @@
       send.innerHTML = svg("send", 14) + "<span>Post</span>";
       send.disabled = true;
 
-      const syncSend = () => { send.disabled = !(ta.value.trim() || atts.length); };
+      const notifyChange = () => {
+        if (onDraftChange) onDraftChange({ body: ta.value, mentions: [...picked.entries()], atts });
+      };
+
+      const syncSend = () => {
+        send.disabled = !(ta.value.trim() || atts.length);
+        notifyChange();
+      };
 
       function addAttachment(blob) {
         if (!blob || atts.length >= 3) return;
@@ -1414,6 +1504,21 @@
           syncSend();
         };
         img.src = objUrl;
+      }
+
+      if (initialDraft) {
+        ta.value = initialDraft.body || "";
+        if (initialDraft.mentions && Array.isArray(initialDraft.mentions)) {
+          initialDraft.mentions.forEach(([tok, uid]) => picked.set(tok, uid));
+        }
+        if (initialDraft.atts && Array.isArray(initialDraft.atts)) {
+          initialDraft.atts.forEach((a) => {
+            if (a.dataUrl) {
+              const b = dataUrlToBlob(a.dataUrl);
+              if (b) addAttachment(b);
+            }
+          });
+        }
       }
 
       function renderChips() {
@@ -1527,6 +1632,7 @@
         send.innerHTML = "<span>…</span>";
         try {
           await onSubmit(body, mentions, atts.map(({ blob, w, h }) => ({ blob, w, h })));
+          if (draftScope) purgeDraft(draftScope);
           atts.forEach((a) => URL.revokeObjectURL(a.objUrl));
         } catch (e) {
           console.warn("[pinstage] post failed:", e);
@@ -1668,12 +1774,12 @@
       renderPins();
     }
 
-    function openNewThreadCard(initialAnchor, initialContext, initialX, initialY) {
+    function openNewThreadCard(initialAnchor, initialContext, initialX, initialY, restoredDraft = null) {
       closeCards();
-      let curAnchor = initialAnchor;
-      let curContext = initialContext;
-      let curX = initialX;
-      let curY = initialY;
+      let curAnchor = restoredDraft?.anchor || initialAnchor;
+      let curContext = restoredDraft?.context || initialContext;
+      let curX = restoredDraft?.x || initialX;
+      let curY = restoredDraft?.y || initialY;
 
       const tempPin = document.createElement("div");
       tempPin.className = "pinbtn newpin st-open active-open";
@@ -1688,18 +1794,31 @@
       card.innerHTML = `<div class="head"><span class="av">${esc(initials(state.me.name))}</span>
         <span class="t">New comment</span><button class="x">${svg("x", 14)}</button></div>`;
       card.querySelector(".x").addEventListener("click", () => {
+        purgeDraft("new");
         tempPin.remove();
         closeCards();
       });
+
+      const onDraftChange = (data) => {
+        persistDraft("new", { ...data, anchor: curAnchor, context: curContext, x: curX, y: curY });
+      };
+
       card.appendChild(
-        buildComposer("Describe the issue or leave feedback…", async (body, mentions, atts) => {
-          await createThread(curAnchor, curContext, body, mentions, atts);
-          tempPin.remove();
-          closeCards();
-          setMode("idle");
-        })
+        buildComposer(
+          "Describe the issue or leave feedback…",
+          async (body, mentions, atts) => {
+            await createThread(curAnchor, curContext, body, mentions, atts);
+            purgeDraft("new");
+            tempPin.remove();
+            closeCards();
+            setMode("idle");
+          },
+          "new",
+          restoredDraft,
+          onDraftChange
+        )
       );
-      placeCard(card, initialX, initialY);
+      placeCard(card, curX, curY);
 
       bindPairedDrag({
         card,
@@ -1710,6 +1829,7 @@
           curContext = res.context;
           curX = pinX;
           curY = pinY;
+          persistDraft("new", { anchor: curAnchor, context: curContext, x: curX, y: curY });
         },
       });
     }
@@ -2034,6 +2154,10 @@
         renderBar();
         await loadThreadsForPage();
         await openDeepLink();
+        const savedDraft = readDraft("new");
+        if (savedDraft && (savedDraft.body || savedDraft.atts?.length)) {
+          openNewThreadCard(savedDraft.anchor, savedDraft.context, savedDraft.x || 120, savedDraft.y || 120, savedDraft);
+        }
         console.debug("[pinstage] ready as", state.me.name);
       } catch (e) {
         console.debug("[pinstage] dormant:", e.message);
