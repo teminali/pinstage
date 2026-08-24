@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * Pinstage — pin comments on your staging environment
  * https://github.com/teminali/pinstage · MIT © Teminali
- * v0.2.1
+ * v0.2.2
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Figma/Vercel-style pinned comment threads for your STAGING environment:
@@ -126,6 +126,15 @@
   };
   const svg = (name, size = 16) =>
     `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[name]}</svg>`;
+
+  /* The Pinstage mark (see assets/logo.svg) — amber pin, white bubble.
+   * Literal colors on purpose: this is the brand, not a themable glyph. */
+  const logo = (size = 16) =>
+    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true">` +
+    `<path fill="#F59E0B" d="M12 1.9C7.2 1.9 3.6 5.6 3.6 10.1c0 4.7 4.9 9.4 7.2 11.7.7.7 1.7.7 2.4 0 2.3-2.3 7.2-7 7.2-11.7 0-4.5-3.6-8.2-8.4-8.2z"/>` +
+    `<circle cx="12" cy="9.7" r="4.1" fill="#fff"/>` +
+    `<path fill="#fff" d="M10.3 12.9 8.9 14.4l.5-2.6z"/>` +
+    `</svg>`;
 
   /* Selector for the element under a click — stable-ish across renders:
    * prefer the nearest #id ancestor, else a short tag:nth-of-type chain. */
@@ -1216,14 +1225,14 @@
         const dot = document.createElement("button");
         dot.className = "dot";
         dot.title = "Pinstage";
-        dot.innerHTML = svg("pin");
+        dot.innerHTML = logo(17);
         dot.addEventListener("click", () => setHidden(false));
         ui.bar.appendChild(dot);
         return;
       }
       const bar = document.createElement("div");
       bar.className = "bar";
-      bar.innerHTML = `<span class="brand" title="Pinstage">${svg("pin", 14)}<span class="env">${esc(cfg.environmentLabel || "Staging")}</span></span>`;
+      bar.innerHTML = `<span class="brand" title="Pinstage">${logo(15)}<span class="env">${esc(cfg.environmentLabel || "Staging")}</span></span>`;
 
       const comment = document.createElement("button");
       comment.className = state.mode === "comment" ? "active" : "";

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-mark.png" width="88" alt="The Pinstage mark — an amber map-pin with a chat-bubble cutout">
+</p>
+
 # Pinstage
 
 **Pin comments on your staging environment.** A Figma/Vercel-style comment
@@ -145,6 +149,27 @@ security fencing everything to the roster — is in
 - Wire-level names (`mdTeamMembers` defaults, `?mdthread=` deep-link param,
   `md_toolbar_mention`) predate the Pinstage name and are kept stable.
 
+## Let your AI agent work the queue (MCP)
+
+Pinstage ships an **MCP server** (`mcp/pinstage-mcp.mjs`, zero dependencies)
+so AI coding agents — Claude Code, Codex, anything MCP — get the issue queue
+as native tools: `pinstage_list_issues`, `pinstage_get_issue` (full thread +
+screenshot URLs), `pinstage_reply`, `pinstage_resolve`, `pinstage_reopen`.
+The loop becomes: a teammate pins an issue on staging → the agent reads it →
+fixes the code → replies and resolves → redeploys.
+
+```bash
+claude mcp add pinstage -- node /path/to/pinstage/mcp/pinstage-mcp.mjs \
+  --env-file /path/to/your-app/.env.local
+```
+
+Config via env (or the `--env-file`): `PINSTAGE_SUPABASE_URL` /
+`PINSTAGE_SERVICE_KEY` (fall back to `NEXT_PUBLIC_SUPABASE_URL` /
+`SUPABASE_ROLE_SERVICE_KEY` naming used by Supabase apps), optional
+`PINSTAGE_PROJECT` default filter and `PINSTAGE_AUTHOR_NAME` for the name
+stamped on the agent's replies. The service key stays inside the MCP process;
+the agent only ever sees tool results.
+
 ## Building a dashboard on top
 
 Pinstage deliberately has no server of its own, so "the API" is your data
@@ -164,7 +189,6 @@ adapter, point your dashboard at whatever store it writes.
   until that is solved per-app, the script-tag install remains the
   recommended path — it also works in every browser, including mobile.
 - Ready-made adapters for Firebase and plain-REST backends.
-- First-party read helpers for dashboard builders.
 
 ## License
 
