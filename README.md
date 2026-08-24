@@ -1,41 +1,49 @@
-# md-toolbar
+# Pinstage
 
-A Figma/Vercel-style **staging toolbar** for your own product: your team clicks
-anywhere on a page, pins a comment there, @mentions teammates, and every
-thread is equally readable by your admin dashboard, scripts, or CI — because
-the toolbar owns no data store of its own.
+**Pin comments on your staging environment.** A Figma/Vercel-style comment
+layer for your own product: your team clicks anywhere on a page, pins a
+thread there, attaches **annotated screenshots**, @mentions teammates — and
+every thread is equally readable by your admin dashboard, scripts, or CI,
+because Pinstage owns no data store of its own.
 
-Built by [Muhasibu Digital](https://mhasibudigital.com) to run its own staging
-environment after hitting the walls of hosted preview-comment tools (seat
-limits, no API). Zero dependencies, one file, shadow-DOM UI.
+One file. Zero dependencies. Shadow-DOM UI with inline SVG icons. MIT.
+
+> Built by [Teminali](https://github.com/teminali) and battle-tested on
+> [M-Digital](https://mhasibudigital.com)'s staging environment, after hitting
+> the walls of hosted preview-comment tools (seat limits, no API).
 
 ## What you get
 
-- **Comment mode** — click anywhere, a numbered pin lands on that element, a
-  thread opens. Pins re-anchor by CSS selector with a document-position
-  fallback, and survive SPA route changes.
+- **Comment mode** — click anywhere; a numbered pin lands on that element and
+  a thread opens. Pins re-anchor by CSS selector with a document-position
+  fallback, survive SPA route changes, and reposition on scroll.
+- **Screenshots** — the composer's camera button captures the current tab via
+  the browser's native `getDisplayMedia` (pixel-perfect, no libraries), then
+  opens a built-in annotation editor: **crop, pen, rectangle, arrow, three
+  ink colors, undo** — before attaching. Paste an image into the composer or
+  pick one from disk, too. Thumbnails render in threads with a lightbox.
 - **Threads** — replies, resolve/reopen, deep links (`?mdthread=<id>` scrolls
   to the pin and opens the thread).
-- **@mentions** — autocomplete from your team roster; mentioned people get a
-  notification through *your* notification system (optional adapter method).
+- **@mentions** — autocomplete from your team roster; notifications go
+  through *your* notification system (optional adapter method).
 - **Inbox** — every open/resolved thread across the app, one click from the bar.
-- **Team-gated** — the toolbar renders *nothing* unless your backend says the
+- **Team-gated** — Pinstage renders *nothing* unless your backend says the
   signed-in user is on the team. It is UI, not a security boundary: every
   call carries the user's own token and your row-level security decides.
 
 ## Install
 
-Serve `md-toolbar.js` from your app (or any static host) and initialize it on
+Serve `pinstage.js` from your app (or any static host) and initialize it on
 the pages where it should exist — typically your staging build only:
 
 ```html
-<script src="/toolbar/md-toolbar.js"></script>
+<script src="/toolbar/pinstage.js"></script>
 <script>
-  MDToolbar.init({
+  Pinstage.init({
     project: "my-web-app",              // shows up on threads and your dashboard
     environmentLabel: "Staging",
     appVersion: "1.2.3",                // optional, attached to new threads
-    adapter: MDToolbar.supabaseAdapter({
+    adapter: Pinstage.supabaseAdapter({
       url: "https://<ref>.supabase.co",
       anonKey: "<anon key>",
       getToken: async () => (await supabase.auth.getSession()).data.session?.access_token ?? null,
@@ -63,6 +71,7 @@ interface Adapter {
   listComments(threadId):       Promise<Array<{id, data}>>;
   addComment(row: {id, data}):  Promise<void>;
   notifyMentions?(p: {targets, actor, threadId, path, url, body, project}): Promise<void>;
+  uploadAttachment?(blob: Blob, meta: {threadId}): Promise<{url}>;  // enables screenshots
 }
 ```
 
@@ -75,7 +84,7 @@ thread.data  = { project, path, query, anchor: {selector, relX, relY, docXPct,
                  {_ts}, messageCount, appVersion, viewport, userAgent,
                  resolvedBy?, resolvedAt? }
 comment.data = { threadId, authorUid, authorName, body, mentions: [uid],
-                 createdAt: {_ts} }
+                 attachments: [{url, w, h}], createdAt: {_ts} }
 ```
 
 Your dashboard integrates by reading the same store the adapter writes — no
@@ -86,7 +95,7 @@ Postgres client.
 ## Supabase adapter
 
 ```js
-MDToolbar.supabaseAdapter({
+Pinstage.supabaseAdapter({
   url, anonKey,
   getToken: async () => "<user JWT or null>",
   tables: {           // optional name overrides (defaults shown)
@@ -98,11 +107,15 @@ MDToolbar.supabaseAdapter({
   uidFromClaims: (claims) => claims.app_metadata?.firebase_uid ?? claims.sub,  // default
   adminSelfRegister: {          // optional: platform admins auto-join the roster
     usersTable: "users",
-    roleSelect: "data->>role",  // PostgREST select expression for the role
+    roleSelect: "data->>role",  // PostgREST select expression
     nameSelect: "data->>fullName",
-    adminRole: "admin",
+    adminRole: "admin",         // compare a boolean flag with roleSelect "data->>isAdmin", adminRole "true"
   },
   mentionType: "md_toolbar_mention",  // notification row `type`
+  storage: {                    // screenshots → a PUBLIC bucket with an
+    bucket: "uploads",          // authenticated INSERT policy. storage: false
+    prefix: "pinstage",         // disables attachments entirely.
+  },
 })
 ```
 
@@ -112,16 +125,32 @@ security fencing everything to the roster — is in
 
 ## Design notes
 
-- **One file, no build.** Vanilla ES2020, injected UI in a shadow root so
-  host CSS and toolbar CSS cannot leak into each other.
+- **One file, no build.** Vanilla ES2020; UI in a shadow root so host CSS and
+  toolbar CSS cannot leak into each other; icons are inline SVG.
 - **Anchoring** stores a short CSS path (`#id` preferred, `tag:nth-of-type`
   chain otherwise) plus the click's relative offset inside that element, with
   a document-percentage fallback for when the selector no longer matches.
+- **Screenshot capture** uses `getDisplayMedia({preferCurrentTab})` — the
+  toolbar hides itself during the grab, caps output at 2560px, and exports
+  JPEG. The annotate editor is canvas-based: ops are re-drawn (undoable),
+  crop flattens with its own undo history.
 - **SPA-aware.** `history.pushState`/`replaceState` are wrapped and
   `popstate` observed; pins reload per pathname.
 - **Timestamps** are `{_ts: <epoch ms>}` objects so they serialize cleanly
   through JSON stores.
+- Wire-level names (`mdTeamMembers` defaults, `?mdthread=` deep-link param,
+  `md_toolbar_mention`) predate the Pinstage name and are kept stable.
+
+## Roadmap
+
+- **Chrome extension distribution** — an options page mapping
+  `domain pattern → project → backend config`, with a content script that
+  injects this same file. The open problem is the auth bridge (a content
+  script cannot read the host app's session directly); until that is solved
+  per-app, the script-tag install remains the recommended path — it also
+  works in every browser, including mobile.
+- Ready-made adapters for Firebase and plain-REST backends.
 
 ## License
 
-MIT © Muhasibu Digital
+MIT © Teminali

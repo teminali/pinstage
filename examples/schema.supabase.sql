@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════
---  md-toolbar — example Supabase schema for the built-in supabaseAdapter
+--  pinstage — example Supabase schema for the built-in supabaseAdapter
 --
 --  Storage convention: id TEXT PRIMARY KEY + data JSONB. Adapt names/paths to
 --  your project (the adapter's `tables` option maps custom names).
@@ -82,3 +82,10 @@ CREATE POLICY "fbcomment_delete" ON "feedbackComments" FOR DELETE TO authenticat
 --   AND data->>'type' = 'md_toolbar_mention'
 --   AND EXISTS (SELECT 1 FROM "mdTeamMembers" m WHERE m.id = data->>'userId')
 -- );
+
+-- ─── Screenshot attachments (optional) ───────────────────────────────────────
+--  Screenshots upload to a PUBLIC storage bucket via the adapter's `storage`
+--  option; the bucket needs an authenticated INSERT policy, e.g.:
+--
+-- CREATE POLICY "uploads_auth_insert" ON storage.objects FOR INSERT TO authenticated
+--   WITH CHECK (bucket_id = 'uploads');

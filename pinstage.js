@@ -1,18 +1,20 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * md-toolbar — an open-source staging toolbar for your own product
- * https://github.com/teminali/md-toolbar · MIT © Muhasibu Digital
+ * Pinstage — pin comments on your staging environment
+ * https://github.com/teminali/pinstage · MIT © Teminali
+ * v0.2.0
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Figma/Vercel-style pinned comment threads for your STAGING environment:
- * your team clicks anywhere on a page, leaves a comment, @mentions teammates,
- * and every thread is equally readable by your admin dashboard, scripts, or
- * CI — because the toolbar owns no data store of its own.
+ * your team clicks anywhere on a page, leaves a comment (with annotated
+ * screenshots), @mentions teammates — and every thread is equally readable by
+ * your admin dashboard, scripts, or CI, because Pinstage owns no data store
+ * of its own.
  *
  * ARCHITECTURE — core + adapter:
- *   The UI core (this file's bulk) talks to a small ADAPTER interface. Ship
- *   the built-in Supabase adapter, or implement ~8 methods against any
- *   backend (REST, GraphQL, Firebase…) and the toolbar works unchanged. Your
- *   dashboard integrates by reading the same store the adapter writes.
+ *   The UI core talks to a small ADAPTER interface. Ship the built-in
+ *   Supabase adapter, or implement ~9 methods against any backend (REST,
+ *   GraphQL, Firebase…) and the toolbar works unchanged. Your dashboard
+ *   integrates by reading the same store the adapter writes.
  *
  *   adapter = {
  *     getIdentity():            Promise<{uid,name,email}|null>   // null → toolbar stays invisible
@@ -24,15 +26,16 @@
  *     listComments(threadId):   Promise<[{id,data}]>
  *     addComment({id,data}):    Promise<void>
  *     notifyMentions?(payload): Promise<void>                    // optional
+ *     uploadAttachment?(blob, {threadId}): Promise<{url}>        // optional — enables screenshots
  *   }
  *
  * QUICK START (Supabase backend — see examples/schema.supabase.sql):
  *
- *   <script src="/toolbar/md-toolbar.js"></script>
+ *   <script src="/toolbar/pinstage.js"></script>
  *   <script>
- *     MDToolbar.init({
+ *     Pinstage.init({
  *       project: "my-web-app",
- *       adapter: MDToolbar.supabaseAdapter({
+ *       adapter: Pinstage.supabaseAdapter({
  *         url: "https://<ref>.supabase.co",
  *         anonKey: "<anon key>",
  *         getToken: async () => sessionAccessTokenOrNull,
@@ -40,17 +43,23 @@
  *     });
  *   </script>
  *
+ * SCREENSHOTS: the composer's camera button captures the current tab via the
+ * browser's native getDisplayMedia (no libraries, pixel-perfect), then opens
+ * a built-in annotation editor — crop, pen, rectangle, arrow, three ink
+ * colors, undo — before attaching. Images can also be pasted straight into
+ * the composer or picked from disk. Uploads go through
+ * adapter.uploadAttachment; without that method the buttons don't render.
+ *
  * The HOST decides where this runs (load the script on staging only). All
  * writes go through your backend's row-level security with the user's own
- * token — the toolbar is UI, not a security boundary.
+ * token — Pinstage is UI, not a security boundary.
  *
- * Zero dependencies. All UI lives in a shadow root so host CSS and toolbar
- * CSS cannot touch each other.
+ * Zero dependencies. All UI lives in a shadow root; icons are inline SVG.
  * ═══════════════════════════════════════════════════════════════════════════ */
 (function () {
   "use strict";
 
-  if (window.MDToolbar) return; // idempotent under double-injection
+  if (window.Pinstage) return; // idempotent under double-injection
 
   /* ── tiny utilities ─────────────────────────────────────────────────────── */
 
@@ -96,6 +105,28 @@
     }
   }
 
+  /* ── inline SVG icon set (stroke style, currentColor) ───────────────────── */
+
+  const I = {
+    pin: '<path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+    comment: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+    inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+    minus: '<path d="M5 12h14"/>',
+    x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+    camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
+    image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+    undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/>',
+    crop: '<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>',
+    pen: '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/>',
+    square: '<rect x="3" y="3" width="18" height="18" rx="2"/>',
+    arrow: '<path d="M7 7h10v10"/><path d="M7 17 17 7"/>',
+    check: '<path d="M20 6 9 17l-5-5"/>',
+    send: '<path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/>',
+    reopen: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+  };
+  const svg = (name, size = 16) =>
+    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[name]}</svg>`;
+
   /* Selector for the element under a click — stable-ish across renders:
    * prefer the nearest #id ancestor, else a short tag:nth-of-type chain. */
   function cssPath(el) {
@@ -120,11 +151,11 @@
   }
 
   /* ═══════════════════════════════════════════════════════════════════════ */
-  /* Built-in Supabase adapter (PostgREST + RLS)                              */
+  /* Built-in Supabase adapter (PostgREST + RLS + Storage)                    */
   /* ═══════════════════════════════════════════════════════════════════════ */
 
   /**
-   * MDToolbar.supabaseAdapter(options)
+   * Pinstage.supabaseAdapter(options)
    *
    * options:
    *   url, anonKey            — the Supabase project
@@ -136,6 +167,11 @@
    *                             lets platform admins auto-join the team roster
    *                             on first use. Off unless provided.
    *   mentionType?            — notification `type` value (default "md_toolbar_mention")
+   *   storage?                — { bucket: "uploads", prefix: "pinstage" }: the
+   *                             PUBLIC Supabase Storage bucket screenshots
+   *                             upload to (authenticated insert policy
+   *                             required). Set storage: false to disable
+   *                             attachments entirely.
    */
   function supabaseAdapter(opts) {
     const T = Object.assign(
@@ -157,12 +193,12 @@
           ...((init_ && init_.headers) || {}),
         },
       });
-      if (!res.ok) throw new Error("[md-toolbar] " + res.status + " " + (await res.text()));
+      if (!res.ok) throw new Error("[pinstage] " + res.status + " " + (await res.text()));
       const text = await res.text();
       return text ? JSON.parse(text) : null;
     }
 
-    return {
+    const adapter = {
       async getIdentity() {
         const token = await opts.getToken();
         if (!token) return null;
@@ -200,7 +236,7 @@
               return { uid, name: member.data.name, email };
             }
           } catch (e) {
-            console.debug("[md-toolbar] admin self-register skipped:", e.message);
+            console.debug("[pinstage] admin self-register skipped:", e.message);
           }
         }
         return null;
@@ -266,6 +302,29 @@
         await rest(T.notifications, { method: "POST", body: JSON.stringify(rows), headers: { Prefer: "return=minimal" } });
       },
     };
+
+    // Screenshot/image attachments → a public Supabase Storage bucket. The
+    // comment embeds the public URL. Set storage: false to strip the feature.
+    if (opts.storage !== false) {
+      adapter.uploadAttachment = async function uploadAttachment(blob, meta) {
+        const token = await opts.getToken();
+        if (!token) throw new Error("no session");
+        const bucket = (opts.storage && opts.storage.bucket) || "uploads";
+        const prefix = (opts.storage && opts.storage.prefix) || "pinstage";
+        const ext = (blob.type.split("/")[1] || "jpg").replace("jpeg", "jpg");
+        const path = prefix + "/" + ((meta && meta.threadId) || "misc") + "/" + uuid() + "." + ext;
+        const base = opts.url.replace(/\/$/, "");
+        const res = await fetch(base + "/storage/v1/object/" + bucket + "/" + path, {
+          method: "POST",
+          headers: { apikey: opts.anonKey, Authorization: "Bearer " + token, "Content-Type": blob.type },
+          body: blob,
+        });
+        if (!res.ok) throw new Error("[pinstage] upload " + res.status + " " + (await res.text()));
+        return { url: base + "/storage/v1/object/public/" + bucket + "/" + path };
+      };
+    }
+
+    return adapter;
   }
 
   /* ═══════════════════════════════════════════════════════════════════════ */
@@ -278,7 +337,7 @@
       cfg.adapter = supabaseAdapter({ url: cfg.supabaseUrl, anonKey: cfg.supabaseAnonKey, getToken: cfg.getToken });
     }
     if (!cfg || !cfg.adapter) {
-      console.warn("[md-toolbar] init: an adapter is required");
+      console.warn("[pinstage] init: an adapter is required");
       return;
     }
     if (init._booted) return;
@@ -286,6 +345,7 @@
 
     const adapter = cfg.adapter;
     const project = cfg.project || "unknown";
+    const canAttach = typeof adapter.uploadAttachment === "function";
 
     const state = {
       me: null,
@@ -314,13 +374,23 @@
       const url = location.origin + state.pathname + location.search +
         (location.search ? "&" : "?") + "mdthread=" + threadId;
       try {
-        await adapter.notifyMentions({ targets, actor: state.me, threadId, path: state.pathname, url, body, project });
+        await adapter.notifyMentions({ targets, actor: state.me, threadId, path: state.pathname, url, body: body || "screenshot", project });
       } catch (e) {
-        console.debug("[md-toolbar] mention notify failed:", e.message);
+        console.debug("[pinstage] mention notify failed:", e.message);
       }
     }
 
-    async function createThread(anchor, body, mentions) {
+    async function uploadAll(threadId, atts) {
+      if (!atts.length || !canAttach) return [];
+      const out = [];
+      for (const a of atts) {
+        const { url } = await adapter.uploadAttachment(a.blob, { threadId });
+        out.push({ url, w: a.w, h: a.h });
+      }
+      return out;
+    }
+
+    async function createThread(anchor, body, mentions, atts) {
       const threadId = uuid();
       const thread = {
         id: threadId,
@@ -329,7 +399,7 @@
           path: state.pathname,
           query: location.search || "",
           anchor,
-          preview: body.slice(0, 140),
+          preview: body.slice(0, 140) || "Screenshot",
           status: "open",
           createdBy: { uid: state.me.uid, name: state.me.name, email: state.me.email },
           createdAt: now(),
@@ -341,16 +411,25 @@
         },
       };
       await adapter.createThread(thread);
-      await addComment(threadId, body, mentions, true);
+      await addComment(threadId, body, mentions, true, atts);
       state.threads.push(thread);
       renderPins();
       return threadId;
     }
 
-    async function addComment(threadId, body, mentions, isFirst) {
+    async function addComment(threadId, body, mentions, isFirst, atts) {
+      const attachments = await uploadAll(threadId, atts || []);
       await adapter.addComment({
         id: uuid(),
-        data: { threadId, authorUid: state.me.uid, authorName: state.me.name, body, mentions, createdAt: now() },
+        data: {
+          threadId,
+          authorUid: state.me.uid,
+          authorName: state.me.name,
+          body,
+          mentions,
+          attachments,
+          createdAt: now(),
+        },
       });
       if (!isFirst) {
         const row = await adapter.getThread(threadId);
@@ -419,37 +498,36 @@
 
     /* ── shadow-DOM UI ── */
     const host = document.createElement("div");
-    host.setAttribute("data-md-toolbar", "");
+    host.setAttribute("data-pinstage", "");
     Object.assign(host.style, { position: "fixed", inset: "0", zIndex: String(cfg.zIndex || 2147483000), pointerEvents: "none" });
     const root = host.attachShadow({ mode: "open" });
 
     const style = document.createElement("style");
     style.textContent = `
       * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-      button { cursor: pointer; border: 0; background: none; color: inherit; font: inherit; }
+      button { cursor: pointer; border: 0; background: none; color: inherit; font: inherit; display: inline-flex; align-items: center; gap: 6px; }
+      svg { flex: none; }
       .bar { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
         display: flex; align-items: center; gap: 2px; padding: 4px;
         background: #0e0f13; color: #e7e8ea; border: 1px solid #2a2c33; border-radius: 999px;
         box-shadow: 0 8px 30px rgba(0,0,0,.35); pointer-events: auto; }
-      .bar .env { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
-        color: #fbbf24; padding: 0 10px; border-right: 1px solid #2a2c33; }
-      .bar button { display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
-        border-radius: 999px; font-size: 12.5px; font-weight: 600; color: #b6b8bf; }
-      .bar button:hover { background: #1c1e24; color: #fff; }
-      .bar button.active { background: #f59e0b; color: #16130a; }
+      .bar .brand { display: flex; align-items: center; gap: 6px; padding: 0 10px; border-right: 1px solid #2a2c33; color: #fbbf24; }
+      .bar .brand .env { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+      .bar > button { height: 32px; padding: 0 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; color: #b6b8bf; justify-content: center; }
+      .bar > button:hover { background: #1c1e24; color: #fff; }
+      .bar > button.active { background: #f59e0b; color: #16130a; }
       .bar .badge { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
         color: #16130a; font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
       .dot { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); width: 34px; height: 34px;
         border-radius: 999px; background: #0e0f13; color: #fbbf24; border: 1px solid #2a2c33; pointer-events: auto;
-        display: flex; align-items: center; justify-content: center; font-size: 15px; box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+        justify-content: center; box-shadow: 0 8px 30px rgba(0,0,0,.35); }
       .overlay { position: fixed; inset: 0; cursor: crosshair; pointer-events: auto; }
       .overlay .hint { position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
         background: #0e0f13; color: #e7e8ea; border: 1px solid #2a2c33; padding: 7px 14px; border-radius: 999px; font-size: 12.5px; }
-      .pin { position: fixed; width: 28px; height: 28px; margin: -14px 0 0 -14px; border-radius: 999px 999px 999px 4px;
-        background: #f59e0b; color: #16130a; font-size: 12px; font-weight: 800; display: flex; align-items: center;
-        justify-content: center; pointer-events: auto; border: 2px solid #fff; box-shadow: 0 3px 10px rgba(0,0,0,.35);
-        transition: transform .12s; }
-      .pin:hover { transform: scale(1.12); }
+      .pinbtn { position: fixed; width: 28px; height: 28px; margin: -14px 0 0 -14px; border-radius: 999px 999px 999px 4px;
+        background: #f59e0b; color: #16130a; font-size: 12px; font-weight: 800; justify-content: center;
+        pointer-events: auto; border: 2px solid #fff; box-shadow: 0 3px 10px rgba(0,0,0,.35); transition: transform .12s; }
+      .pinbtn:hover { transform: scale(1.12); }
       .card { position: fixed; width: 340px; max-width: calc(100vw - 24px); background: #0e0f13; color: #e7e8ea;
         border: 1px solid #2a2c33; border-radius: 14px; box-shadow: 0 16px 50px rgba(0,0,0,.5);
         pointer-events: auto; display: flex; flex-direction: column; overflow: hidden; }
@@ -461,36 +539,61 @@
       .msgs { max-height: 260px; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
       .msg { display: flex; gap: 8px; }
       .av { width: 24px; height: 24px; border-radius: 999px; background: #2a2c33; color: #e7e8ea; font-size: 10px;
-        font-weight: 700; display: flex; align-items: center; justify-content: center; flex: none; }
-      .msg .b { min-width: 0; }
+        font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+      .msg .b { min-width: 0; flex: 1; }
       .msg .who { font-size: 11px; color: #8b8e98; margin-bottom: 2px; }
       .msg .who b { color: #e7e8ea; font-size: 11.5px; }
       .msg .txt { font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-wrap: break-word; }
       .msg .txt .mn { color: #fbbf24; font-weight: 600; }
+      .atts { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+      .atts img { height: 64px; max-width: 120px; object-fit: cover; border-radius: 8px; border: 1px solid #2a2c33; cursor: zoom-in; }
       .compose { position: relative; border-top: 1px solid #22242b; padding: 10px 12px; }
       .compose textarea { width: 100%; min-height: 60px; resize: none; background: #16181d; color: #e7e8ea;
         border: 1px solid #2a2c33; border-radius: 10px; padding: 8px 10px; font-size: 13px; line-height: 1.4; outline: none; }
       .compose textarea:focus { border-color: #f59e0b55; }
-      .compose .row { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+      .chips { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+      .chip { position: relative; width: 56px; height: 42px; border-radius: 8px; overflow: hidden; border: 1px solid #2a2c33; }
+      .chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .chip button { position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 999px;
+        background: rgba(0,0,0,.65); color: #fff; justify-content: center; }
+      .compose .row { display: flex; align-items: center; gap: 4px; margin-top: 8px; }
+      .compose .iconbtn { width: 30px; height: 30px; border-radius: 8px; color: #8b8e98; justify-content: center; }
+      .compose .iconbtn:hover { background: #1c1e24; color: #fff; }
+      .compose .hintline { font-size: 10.5px; color: #6b6e78; flex: 1; text-align: right; margin-right: 8px; }
       .compose .send { background: #f59e0b; color: #16130a; font-size: 12.5px; font-weight: 700; padding: 6px 14px; border-radius: 999px; }
       .compose .send:disabled { opacity: .45; cursor: default; }
-      .compose .hintline { font-size: 10.5px; color: #6b6e78; }
       .mentions { position: absolute; bottom: calc(100% - 4px); left: 12px; right: 12px; background: #16181d;
         border: 1px solid #2a2c33; border-radius: 10px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
       .mentions button { display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 10px; font-size: 12.5px; color: #e7e8ea; }
       .mentions button:hover { background: #22242b; }
-      .inbox { position: fixed; right: 16px; bottom: 64px; width: 380px; max-width: calc(100vw - 24px);
+      .inboxcard { position: fixed; right: 16px; bottom: 64px; width: 380px; max-width: calc(100vw - 24px);
         max-height: min(520px, calc(100vh - 96px)); }
       .tabs { display: flex; gap: 2px; padding: 8px 10px 0; }
       .tabs button { font-size: 12px; font-weight: 600; color: #8b8e98; padding: 6px 12px; border-radius: 8px 8px 0 0; }
       .tabs button.on { background: #16181d; color: #fff; }
       .rows { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; background: #16181d; flex: 1; }
-      .rowitem { text-align: left; background: #0e0f13; border: 1px solid #22242b; border-radius: 10px; padding: 9px 11px; }
+      .rowitem { text-align: left; background: #0e0f13; border: 1px solid #22242b; border-radius: 10px; padding: 9px 11px; display: block; width: 100%; }
       .rowitem:hover { border-color: #f59e0b66; }
       .rowitem .p { font-size: 11px; color: #fbbf24; font-weight: 600; margin-bottom: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .rowitem .s { font-size: 12.5px; color: #e7e8ea; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
       .rowitem .m { font-size: 10.5px; color: #6b6e78; margin-top: 4px; }
       .empty { padding: 26px 12px; text-align: center; font-size: 12.5px; color: #6b6e78; }
+      .editor { position: fixed; inset: 0; background: rgba(4,5,8,.8); display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 12px; pointer-events: auto; }
+      .editor canvas { max-width: calc(100vw - 48px); max-height: calc(100vh - 150px); border-radius: 10px;
+        box-shadow: 0 20px 60px rgba(0,0,0,.6); background: #000; touch-action: none; }
+      .etools { display: flex; align-items: center; gap: 4px; background: #0e0f13; border: 1px solid #2a2c33;
+        padding: 5px; border-radius: 999px; color: #b6b8bf; }
+      .etools button { width: 32px; height: 32px; border-radius: 999px; justify-content: center; }
+      .etools button:hover { background: #1c1e24; color: #fff; }
+      .etools button.on { background: #f59e0b; color: #16130a; }
+      .etools .sep { width: 1px; height: 18px; background: #2a2c33; margin: 0 3px; }
+      .etools .sw { width: 18px; height: 18px; border-radius: 999px; border: 2px solid transparent; padding: 0; }
+      .etools .sw.on { border-color: #fff; }
+      .etools .use { width: auto; padding: 0 14px; background: #f59e0b; color: #16130a; font-size: 12.5px; font-weight: 700; }
+      .lightbox { position: fixed; inset: 0; background: rgba(4,5,8,.88); display: flex; align-items: center;
+        justify-content: center; pointer-events: auto; cursor: zoom-out; }
+      .lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 10px; }
     `;
     root.appendChild(style);
 
@@ -498,23 +601,338 @@
       bar: document.createElement("div"),
       pins: document.createElement("div"),
       layer: document.createElement("div"),
+      top: document.createElement("div"), // editor / lightbox — above cards
     };
     root.appendChild(ui.pins);
     root.appendChild(ui.layer);
     root.appendChild(ui.bar);
+    root.appendChild(ui.top);
 
-    /* ── mention-aware composer (shared by new-thread + reply) ── */
+    /* ── screenshots: capture + annotate ── */
+
+    async function captureTab() {
+      if (!navigator.mediaDevices?.getDisplayMedia) return null;
+      host.style.display = "none"; // keep Pinstage itself out of the shot
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { displaySurface: "browser" },
+          audio: false,
+          preferCurrentTab: true,
+          selfBrowserSurface: "include",
+        });
+        const video = document.createElement("video");
+        video.srcObject = stream;
+        video.muted = true;
+        await video.play();
+        // Give the share-dialog a beat to dismiss so it isn't in the frame.
+        await new Promise((r) => setTimeout(r, 450));
+        const scale = Math.min(1, 2560 / Math.max(video.videoWidth, video.videoHeight || 1));
+        const c = document.createElement("canvas");
+        c.width = Math.max(1, Math.round(video.videoWidth * scale));
+        c.height = Math.max(1, Math.round(video.videoHeight * scale));
+        c.getContext("2d").drawImage(video, 0, 0, c.width, c.height);
+        stream.getTracks().forEach((t) => t.stop());
+        return c;
+      } catch (e) {
+        console.debug("[pinstage] capture cancelled:", e.message);
+        return null;
+      } finally {
+        host.style.display = "";
+      }
+    }
+
+    /** Annotation editor over a captured canvas. Resolves a JPEG Blob, or null. */
+    function openEditor(baseCanvas) {
+      return new Promise((resolve) => {
+        let base = baseCanvas;
+        let ops = [];        // {tool, color, points|x/y/w/h|x1..y2}
+        const history = [];  // pre-crop {base, ops} snapshots
+        let tool = "pen";
+        let color = "#ef4444";
+        let drag = null;
+
+        const wrap = document.createElement("div");
+        wrap.className = "editor";
+        const cv = document.createElement("canvas");
+        const ctx = cv.getContext("2d");
+        const tools = document.createElement("div");
+        tools.className = "etools";
+        wrap.appendChild(cv);
+        wrap.appendChild(tools);
+        ui.top.appendChild(wrap);
+
+        const lw = () => Math.max(3, Math.round(base.width / 420));
+
+        function drawOp(o) {
+          ctx.strokeStyle = o.color;
+          ctx.lineWidth = lw();
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          if (o.tool === "pen") {
+            ctx.beginPath();
+            o.points.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+            ctx.stroke();
+          } else if (o.tool === "square") {
+            ctx.strokeRect(o.x, o.y, o.w, o.h);
+          } else if (o.tool === "arrow") {
+            const a = Math.atan2(o.y2 - o.y1, o.x2 - o.x1);
+            const hl = lw() * 4;
+            ctx.beginPath();
+            ctx.moveTo(o.x1, o.y1);
+            ctx.lineTo(o.x2, o.y2);
+            ctx.moveTo(o.x2, o.y2);
+            ctx.lineTo(o.x2 - hl * Math.cos(a - 0.45), o.y2 - hl * Math.sin(a - 0.45));
+            ctx.moveTo(o.x2, o.y2);
+            ctx.lineTo(o.x2 - hl * Math.cos(a + 0.45), o.y2 - hl * Math.sin(a + 0.45));
+            ctx.stroke();
+          }
+        }
+
+        function redraw(marquee) {
+          cv.width = base.width;
+          cv.height = base.height;
+          ctx.drawImage(base, 0, 0);
+          ops.forEach(drawOp);
+          if (drag && tool !== "crop") drawOp(dragOp());
+          if (marquee && drag) {
+            const { x, y, w, h } = normRect(drag);
+            ctx.save();
+            ctx.fillStyle = "rgba(4,5,8,.55)";
+            // dim everything but the marquee
+            ctx.beginPath();
+            ctx.rect(0, 0, cv.width, cv.height);
+            ctx.rect(x, y, w, h);
+            ctx.fill("evenodd");
+            ctx.strokeStyle = "#f59e0b";
+            ctx.lineWidth = Math.max(2, lw() / 2);
+            ctx.setLineDash([8, 6]);
+            ctx.strokeRect(x, y, w, h);
+            ctx.restore();
+          }
+        }
+
+        const normRect = (d) => ({
+          x: Math.min(d.x0, d.x1), y: Math.min(d.y0, d.y1),
+          w: Math.abs(d.x1 - d.x0), h: Math.abs(d.y1 - d.y0),
+        });
+
+        const dragOp = () =>
+          tool === "pen"
+            ? { tool, color, points: drag.points }
+            : tool === "square"
+              ? { tool, color, ...normRect(drag) }
+              : { tool, color, x1: drag.x0, y1: drag.y0, x2: drag.x1, y2: drag.y1 };
+
+        function toCanvas(e) {
+          const r = cv.getBoundingClientRect();
+          return { x: ((e.clientX - r.left) * cv.width) / r.width, y: ((e.clientY - r.top) * cv.height) / r.height };
+        }
+
+        cv.addEventListener("pointerdown", (e) => {
+          cv.setPointerCapture(e.pointerId);
+          const p = toCanvas(e);
+          drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, points: [p] };
+        });
+        cv.addEventListener("pointermove", (e) => {
+          if (!drag) return;
+          const p = toCanvas(e);
+          drag.x1 = p.x;
+          drag.y1 = p.y;
+          drag.points.push(p);
+          redraw(tool === "crop");
+        });
+        cv.addEventListener("pointerup", () => {
+          if (!drag) return;
+          if (tool === "crop") {
+            const { x, y, w, h } = normRect(drag);
+            drag = null;
+            if (w > 24 && h > 24) {
+              history.push({ base, ops: [...ops] });
+              redraw(false); // flatten ops into the pixels we crop
+              const c2 = document.createElement("canvas");
+              c2.width = Math.round(w);
+              c2.height = Math.round(h);
+              c2.getContext("2d").drawImage(cv, x, y, w, h, 0, 0, w, h);
+              base = c2;
+              ops = [];
+            }
+          } else {
+            ops.push(dragOp());
+            drag = null;
+          }
+          redraw(false);
+        });
+
+        function toolBtn(name, tip) {
+          const b = document.createElement("button");
+          b.innerHTML = svg(name);
+          b.title = tip;
+          b.addEventListener("click", () => {
+            tool = name === "square" || name === "arrow" || name === "crop" ? name : "pen";
+            tool = name; // pen/square/arrow/crop share their icon names
+            tools.querySelectorAll("button[data-tool]").forEach((x) => x.classList.toggle("on", x === b));
+          });
+          b.dataset.tool = name;
+          return b;
+        }
+
+        const pen = toolBtn("pen", "Draw");
+        pen.classList.add("on");
+        tools.appendChild(pen);
+        tools.appendChild(toolBtn("square", "Rectangle"));
+        tools.appendChild(toolBtn("arrow", "Arrow"));
+        tools.appendChild(toolBtn("crop", "Crop"));
+        tools.insertAdjacentHTML("beforeend", '<span class="sep"></span>');
+        ["#ef4444", "#f59e0b", "#3b82f6"].forEach((c, i) => {
+          const b = document.createElement("button");
+          b.className = "sw" + (i === 0 ? " on" : "");
+          b.style.background = c;
+          b.title = "Ink color";
+          b.addEventListener("click", () => {
+            color = c;
+            tools.querySelectorAll(".sw").forEach((x) => x.classList.toggle("on", x === b));
+          });
+          tools.appendChild(b);
+        });
+        tools.insertAdjacentHTML("beforeend", '<span class="sep"></span>');
+        const undo = document.createElement("button");
+        undo.innerHTML = svg("undo");
+        undo.title = "Undo";
+        undo.addEventListener("click", () => {
+          if (ops.length) ops.pop();
+          else if (history.length) ({ base, ops } = history.pop());
+          redraw(false);
+        });
+        tools.appendChild(undo);
+        const cancel = document.createElement("button");
+        cancel.innerHTML = svg("x");
+        cancel.title = "Discard";
+        const use = document.createElement("button");
+        use.className = "use";
+        use.innerHTML = svg("check") + "<span>Use</span>";
+        tools.appendChild(cancel);
+        tools.appendChild(use);
+
+        const cleanup = () => {
+          wrap.remove();
+          removeEventListener("keydown", onKey, true);
+        };
+        const onKey = (e) => {
+          if (e.key === "Escape") {
+            e.stopPropagation();
+            cleanup();
+            resolve(null);
+          }
+        };
+        addEventListener("keydown", onKey, true);
+        cancel.addEventListener("click", () => { cleanup(); resolve(null); });
+        use.addEventListener("click", () => {
+          redraw(false);
+          cv.toBlob((b) => { cleanup(); resolve(b); }, "image/jpeg", 0.85);
+        });
+
+        redraw(false);
+      });
+    }
+
+    function showLightbox(url) {
+      const lb = document.createElement("div");
+      lb.className = "lightbox";
+      lb.innerHTML = `<img src="${esc(url)}">`;
+      lb.addEventListener("click", () => lb.remove());
+      ui.top.appendChild(lb);
+    }
+
+    /* ── mention-aware composer with attachments ── */
     function buildComposer(placeholder, onSubmit) {
       const wrap = document.createElement("div");
       wrap.className = "compose";
       wrap.innerHTML = `
         <textarea placeholder="${esc(placeholder)}"></textarea>
-        <div class="row"><span class="hintline">@ to mention · Esc to close</span>
-        <button class="send" disabled>Post</button></div>`;
+        <div class="chips"></div>
+        <div class="row"></div>`;
       const ta = wrap.querySelector("textarea");
-      const send = wrap.querySelector(".send");
+      const chips = wrap.querySelector(".chips");
+      const row = wrap.querySelector(".row");
       const picked = new Map(); // "@Name" token -> uid
+      const atts = [];          // {blob, w, h, objUrl}
       let dropdown = null;
+
+      const send = document.createElement("button");
+      send.className = "send";
+      send.innerHTML = svg("send", 14) + "<span>Post</span>";
+      send.disabled = true;
+
+      const syncSend = () => { send.disabled = !(ta.value.trim() || atts.length); };
+
+      function addAttachment(blob) {
+        if (!blob || atts.length >= 3) return;
+        const objUrl = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          atts.push({ blob, w: img.naturalWidth, h: img.naturalHeight, objUrl });
+          renderChips();
+          syncSend();
+        };
+        img.src = objUrl;
+      }
+
+      function renderChips() {
+        chips.innerHTML = "";
+        atts.forEach((a, i) => {
+          const chip = document.createElement("div");
+          chip.className = "chip";
+          chip.innerHTML = `<img src="${a.objUrl}"><button title="Remove">${svg("x", 10)}</button>`;
+          chip.querySelector("button").addEventListener("click", () => {
+            URL.revokeObjectURL(a.objUrl);
+            atts.splice(i, 1);
+            renderChips();
+            syncSend();
+          });
+          chips.appendChild(chip);
+        });
+      }
+
+      if (canAttach) {
+        const shot = document.createElement("button");
+        shot.className = "iconbtn";
+        shot.innerHTML = svg("camera");
+        shot.title = "Capture & annotate a screenshot of this tab";
+        shot.addEventListener("click", async () => {
+          const grabbed = await captureTab();
+          if (!grabbed) return;
+          const blob = await openEditor(grabbed);
+          if (blob) addAttachment(blob);
+        });
+        row.appendChild(shot);
+
+        const file = document.createElement("input");
+        file.type = "file";
+        file.accept = "image/*";
+        file.style.display = "none";
+        file.addEventListener("change", () => {
+          if (file.files?.[0]) addAttachment(file.files[0]);
+          file.value = "";
+        });
+        const pick = document.createElement("button");
+        pick.className = "iconbtn";
+        pick.innerHTML = svg("image");
+        pick.title = "Attach an image (or paste one into the text box)";
+        pick.addEventListener("click", () => file.click());
+        row.appendChild(pick);
+        row.appendChild(file);
+
+        ta.addEventListener("paste", (e) => {
+          const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith("image/"));
+          if (item) {
+            e.preventDefault();
+            addAttachment(item.getAsFile());
+          }
+        });
+      }
+
+      row.insertAdjacentHTML("beforeend", '<span class="hintline">@ to mention · Esc to close</span>');
+      row.appendChild(send);
 
       const closeDropdown = () => { if (dropdown) { dropdown.remove(); dropdown = null; } };
 
@@ -532,7 +950,7 @@
             ta.value = ta.value.slice(0, replaceFrom) + token + " " + ta.value.slice(ta.selectionStart);
             closeDropdown();
             ta.focus();
-            send.disabled = !ta.value.trim();
+            syncSend();
           });
           dropdown.appendChild(b);
         });
@@ -540,7 +958,7 @@
       }
 
       ta.addEventListener("input", () => {
-        send.disabled = !ta.value.trim();
+        syncSend();
         const upto = ta.value.slice(0, ta.selectionStart);
         const m = upto.match(/@([\w .-]{0,20})$/);
         if (m) {
@@ -553,20 +971,21 @@
       });
       ta.addEventListener("keydown", (e) => {
         if (e.key === "Escape") closeDropdown();
-        if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && ta.value.trim()) send.click();
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !send.disabled) send.click();
         e.stopPropagation();
       });
       send.addEventListener("click", async () => {
         const body = ta.value.trim();
-        if (!body) return;
+        if (!body && !atts.length) return;
         const mentions = [...new Set([...picked.entries()].filter(([tok]) => body.includes(tok)).map(([, uid]) => uid))];
         send.disabled = true;
-        send.textContent = "…";
+        send.innerHTML = "<span>…</span>";
         try {
-          await onSubmit(body, mentions);
+          await onSubmit(body, mentions, atts.map(({ blob, w, h }) => ({ blob, w, h })));
+          atts.forEach((a) => URL.revokeObjectURL(a.objUrl));
         } catch (e) {
           console.warn(e);
-          send.textContent = "Post";
+          send.innerHTML = svg("send", 14) + "<span>Post</span>";
           send.disabled = false;
         }
       });
@@ -601,11 +1020,11 @@
       const card = document.createElement("div");
       card.className = "card";
       card.innerHTML = `<div class="head"><span class="av">${esc(initials(state.me.name))}</span>
-        <span class="t">New comment</span><button class="x">✕</button></div>`;
+        <span class="t">New comment</span><button class="x">${svg("x", 14)}</button></div>`;
       card.querySelector(".x").addEventListener("click", closeCards);
       card.appendChild(
-        buildComposer("Describe the issue or leave feedback…", async (body, mentions) => {
-          await createThread(anchor, body, mentions);
+        buildComposer("Describe the issue or leave feedback…", async (body, mentions, atts) => {
+          await createThread(anchor, body, mentions, atts);
           closeCards();
           setMode("idle");
         })
@@ -622,8 +1041,8 @@
       const resolved = d.status === "resolved";
       card.innerHTML = `<div class="head">
           <span class="t">${esc(d.createdBy?.name || "Thread")} · ${esc(timeAgo(d.createdAt?._ts))}</span>
-          <button class="res">${resolved ? "Reopen" : "Resolve ✓"}</button>
-          <button class="x">✕</button>
+          <button class="res" title="${resolved ? "Reopen" : "Resolve"}">${svg(resolved ? "reopen" : "check", 14)}<span>${resolved ? "Reopen" : "Resolve"}</span></button>
+          <button class="x">${svg("x", 14)}</button>
         </div>
         <div class="msgs"><div class="empty">Loading…</div></div>`;
       card.querySelector(".x").addEventListener("click", closeCards);
@@ -632,13 +1051,14 @@
         closeCards();
       });
       card.appendChild(
-        buildComposer("Reply…", async (body, mentions) => {
-          await addComment(thread.id, body, mentions, false);
+        buildComposer("Reply…", async (body, mentions, atts) => {
+          await addComment(thread.id, body, mentions, false, atts);
           await fill();
           const ta = card.querySelector(".compose textarea");
           ta.value = "";
+          card.querySelector(".compose .chips").innerHTML = "";
           const send = card.querySelector(".compose .send");
-          send.textContent = "Post";
+          send.innerHTML = svg("send", 14) + "<span>Post</span>";
           send.disabled = true;
         })
       );
@@ -652,10 +1072,17 @@
               .map(
                 (c) => `<div class="msg"><span class="av">${esc(initials(c.data.authorName))}</span>
                   <div class="b"><div class="who"><b>${esc(c.data.authorName)}</b> · ${esc(timeAgo(c.data.createdAt?._ts))}</div>
-                  <div class="txt">${renderBody(c.data.body, c.data.mentions)}</div></div></div>`
+                  <div class="txt">${renderBody(c.data.body, c.data.mentions)}</div>
+                  ${(c.data.attachments || []).length
+                    ? `<div class="atts">${c.data.attachments.map((a) => `<img src="${esc(a.url)}" loading="lazy">`).join("")}</div>`
+                    : ""}
+                  </div></div>`
               )
               .join("")
           : `<div class="empty">No comments</div>`;
+        box.querySelectorAll(".atts img").forEach((img) =>
+          img.addEventListener("click", () => showLightbox(img.src))
+        );
         box.scrollTop = box.scrollHeight;
       };
       await fill();
@@ -668,7 +1095,7 @@
       state.threads.forEach((t, i) => {
         const p = anchorPoint(t.data?.anchor);
         const pin = document.createElement("button");
-        pin.className = "pin";
+        pin.className = "pinbtn";
         pin.textContent = String(i + 1);
         pin.style.left = p.x + "px";
         pin.style.top = p.y + "px";
@@ -722,8 +1149,8 @@
     async function renderInbox() {
       closeCards();
       const card = document.createElement("div");
-      card.className = "card inbox";
-      card.innerHTML = `<div class="head"><span class="t">Issues · ${esc(project)}</span><button class="x">✕</button></div>
+      card.className = "card inboxcard";
+      card.innerHTML = `<div class="head"><span class="t">Issues · ${esc(project)}</span><button class="x">${svg("x", 14)}</button></div>
         <div class="tabs"><button data-t="open">Open</button><button data-t="resolved">Resolved</button></div>
         <div class="rows"><div class="empty">Loading…</div></div>`;
       card.querySelector(".x").addEventListener("click", () => { state.inboxOpen = false; closeCards(); });
@@ -771,24 +1198,24 @@
       if (state.hidden) {
         const dot = document.createElement("button");
         dot.className = "dot";
-        dot.title = "md-toolbar";
-        dot.textContent = "◍";
+        dot.title = "Pinstage";
+        dot.innerHTML = svg("pin");
         dot.addEventListener("click", () => { state.hidden = false; renderBar(); renderPins(); });
         ui.bar.appendChild(dot);
         return;
       }
       const bar = document.createElement("div");
       bar.className = "bar";
-      bar.innerHTML = `<span class="env">${esc(cfg.environmentLabel || "Staging")}</span>`;
+      bar.innerHTML = `<span class="brand" title="Pinstage">${svg("pin", 14)}<span class="env">${esc(cfg.environmentLabel || "Staging")}</span></span>`;
 
       const comment = document.createElement("button");
       comment.className = state.mode === "comment" ? "active" : "";
-      comment.textContent = state.mode === "comment" ? "Click the page…" : "💬 Comment";
+      comment.innerHTML = svg("comment", 14) + `<span>${state.mode === "comment" ? "Click the page…" : "Comment"}</span>`;
       comment.addEventListener("click", () => setMode(state.mode === "comment" ? "idle" : "comment"));
       bar.appendChild(comment);
 
       const inbox = document.createElement("button");
-      inbox.innerHTML = `Issues ${state.threads.length ? `<span class="badge">${state.threads.length}</span>` : ""}`;
+      inbox.innerHTML = svg("inbox", 14) + `<span>Issues</span>${state.threads.length ? `<span class="badge">${state.threads.length}</span>` : ""}`;
       inbox.title = "All reported issues";
       inbox.addEventListener("click", () => {
         state.inboxOpen = !state.inboxOpen;
@@ -798,7 +1225,7 @@
       bar.appendChild(inbox);
 
       const hide = document.createElement("button");
-      hide.textContent = "–";
+      hide.innerHTML = svg("minus", 14);
       hide.title = "Hide toolbar";
       hide.addEventListener("click", () => { state.hidden = true; closeCards(); setMode("idle"); renderBar(); renderPins(); });
       bar.appendChild(hide);
@@ -812,7 +1239,7 @@
       state.pathname = location.pathname;
       closeCards();
       setMode("idle");
-      loadThreadsForPage().catch((e) => console.debug("[md-toolbar]", e.message));
+      loadThreadsForPage().catch((e) => console.debug("[pinstage]", e.message));
     }
     ["pushState", "replaceState"].forEach((fn) => {
       const orig = history[fn];
@@ -840,7 +1267,7 @@
           openThreadCard(t, p.x, p.y);
         }, 350);
       } catch (e) {
-        console.debug("[md-toolbar] deep link failed:", e.message);
+        console.debug("[pinstage] deep link failed:", e.message);
       }
     }
 
@@ -854,12 +1281,14 @@
         renderBar();
         await loadThreadsForPage();
         await openDeepLink();
-        console.debug("[md-toolbar] ready as", state.me.name);
+        console.debug("[pinstage] ready as", state.me.name);
       } catch (e) {
-        console.debug("[md-toolbar] dormant:", e.message);
+        console.debug("[pinstage] dormant:", e.message);
       }
     })();
   }
 
-  window.MDToolbar = { init, supabaseAdapter };
+  window.Pinstage = { init, supabaseAdapter };
+  // Back-compat with the pre-rename global.
+  window.MDToolbar = window.Pinstage;
 })();
