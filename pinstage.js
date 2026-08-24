@@ -1957,15 +1957,25 @@
         if (freshThread) {
           thread.data = freshThread.data;
           const st = thread.data.status || "open";
-          const meta = getStatusMeta(st);
+          const startTime = (st === "in_progress" || st === "deploying")
+            ? (thread.data.claimedBy?.claimedAt?._ts || thread.data.lastActivityAt?._ts || thread.data.createdAt?._ts || Date.now())
+            : null;
+          const meta = getStatusMeta(st, startTime);
           const stEl = card.querySelector(".head .stbadge");
           if (stEl) {
             stEl.className = `stbadge ${meta.class}`;
-            stEl.innerHTML = `<span class="stdot"></span>${meta.label}`;
+            stEl.dataset.startTime = startTime || "";
+            stEl.innerHTML = `<span class="stdot"></span>${meta.label}${meta.timerHtml}`;
           }
         }
         await fill();
       };
+
+      if (cardTickerTimer) { clearInterval(cardTickerTimer); cardTickerTimer = null; }
+      updateRowTimers(card);
+      cardTickerTimer = setInterval(() => {
+        updateRowTimers(card);
+      }, 1000);
 
       await fill();
     }
