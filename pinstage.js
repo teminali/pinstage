@@ -1917,24 +1917,42 @@
       const fill = async () => {
         const comments = await adapter.listComments(thread.id);
         const box = card.querySelector(".msgs");
-        box.innerHTML = comments.length
-          ? comments
-              .map(
-                (c) => `<div class="msg"><span class="av">${esc(initials(c.data.authorName))}</span>
-                  <div class="b"><div class="who"><b>${esc(c.data.authorName)}</b> · ${esc(timeAgo(c.data.createdAt?._ts))}</div>
-                  <div class="txt">${renderBody(c.data.body, c.data.mentions)}</div>
-                  ${(c.data.attachments || []).length
-                    ? `<div class="atts">${c.data.attachments.map((a) => `<img src="${esc(a.url)}" loading="lazy">`).join("")}</div>`
-                    : ""}
-                  </div></div>`
-              )
-              .join("")
-          : `<div class="empty">No comments</div>`;
-        box.querySelectorAll(".atts img").forEach((img) =>
-          img.addEventListener("click", () => showLightbox(img.src))
-        );
-        box.scrollTop = box.scrollHeight;
+        if (box) {
+          box.innerHTML = comments.length
+            ? comments
+                .map(
+                  (c) => `<div class="msg"><span class="av">${esc(initials(c.data.authorName))}</span>
+                    <div class="b"><div class="who"><b>${esc(c.data.authorName)}</b> · ${esc(timeAgo(c.data.createdAt?._ts))}</div>
+                    <div class="txt">${renderBody(c.data.body, c.data.mentions)}</div>
+                    ${(c.data.attachments || []).length
+                      ? `<div class="atts">${c.data.attachments.map((a) => `<img src="${esc(a.url)}" loading="lazy">`).join("")}</div>`
+                      : ""}
+                    </div></div>`
+                )
+                .join("")
+            : `<div class="empty">No comments</div>`;
+          box.querySelectorAll(".atts img").forEach((img) =>
+            img.addEventListener("click", () => showLightbox(img.src))
+          );
+          box.scrollTop = box.scrollHeight;
+        }
       };
+
+      state.activeThreadRefresher = async () => {
+        const freshThread = state.threads.find((t) => t.id === thread.id);
+        if (freshThread) {
+          thread.data = freshThread.data;
+          const st = thread.data.status || "open";
+          const meta = getStatusMeta(st);
+          const stEl = card.querySelector(".head .stbadge");
+          if (stEl) {
+            stEl.className = `stbadge ${meta.class}`;
+            stEl.innerHTML = `<span class="stdot"></span>${meta.label}`;
+          }
+        }
+        await fill();
+      };
+
       await fill();
     }
 
@@ -2062,6 +2080,9 @@
       ui.layer.appendChild(card);
       bindPairedDrag({ card });
       state.activeInboxRefresher = (tab) => showTab(tab, true);
+      state.activeInboxRefresher = async (tab) => {
+        await showTab(tab || state.inboxTab || "open");
+      };
       await showTab(state.inboxTab);
     }
 
@@ -2086,7 +2107,7 @@
 
     function startRealtimeSync() {
       if (syncTimer) clearInterval(syncTimer);
-      syncTimer = setInterval(syncRealtime, 2500);
+      syncTimer = setInterval(syncRealtime, 1500);
       addEventListener("focus", syncRealtime);
       document.addEventListener("visibilitychange", () => {
         if (!document.hidden) syncRealtime();
@@ -2234,6 +2255,7 @@
         document.body.appendChild(host);
         renderBar();
         await loadThreadsForPage();
+        startRealtimeSync();
         await openDeepLink();
         const savedDraft = readDraft("new");
         if (savedDraft && (savedDraft.body || savedDraft.atts?.length)) {
