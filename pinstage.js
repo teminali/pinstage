@@ -920,6 +920,7 @@
         background: #f59e0b; color: #16130a; font-size: 12px; font-weight: 800; justify-content: center;
         pointer-events: auto; border: 2px solid #fff; box-shadow: 0 3px 10px rgba(0,0,0,.35); transition: transform .12s; }
       .pinbtn:hover { transform: scale(1.12); }
+      .pinbtn.active-open { transform: scale(1.18); border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.45); z-index: 10; cursor: grab; }
       .pinbtn.st-open { background: #f59e0b; color: #16130a; }
       .pinbtn.st-in-progress { background: #0284c7; color: #fff; animation: psPulseBlue 1.8s infinite; }
       .pinbtn.st-deploying { background: #9333ea; color: #fff; animation: psPulsePurple 1.8s infinite; }
@@ -1442,119 +1443,106 @@
     }
 
 
-    function makeCardDraggable(card) {
+    function bindPairedDrag({ card, pin, onDrop }) {
       const head = card.querySelector(".head");
       if (!head) return;
       head.style.cursor = "grab";
       head.style.userSelect = "none";
       head.style.touchAction = "none";
+      if (pin) {
+        pin.style.cursor = "grab";
+        pin.style.touchAction = "none";
+        pin.style.userSelect = "none";
+      }
 
       let dragging = false;
       let startX = 0;
       let startY = 0;
-      let initLeft = 0;
-      let initTop = 0;
-
-      const onPointerDown = (e) => {
-        if (e.target && e.target.closest("button, input, textarea, a, select")) return;
-        dragging = true;
-        head.style.cursor = "grabbing";
-        startX = e.clientX;
-        startY = e.clientY;
-        const rect = card.getBoundingClientRect();
-        initLeft = rect.left;
-        initTop = rect.top;
-        try { head.setPointerCapture(e.pointerId); } catch {}
-        e.preventDefault();
-      };
-
-      const onPointerMove = (e) => {
-        if (!dragging) return;
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-        const w = card.offsetWidth || 340;
-        const h = card.offsetHeight || 200;
-        const maxLeft = Math.max(8, window.innerWidth - w - 8);
-        const maxTop = Math.max(8, window.innerHeight - h - 8);
-        const newLeft = Math.min(Math.max(8, initLeft + dx), maxLeft);
-        const newTop = Math.min(Math.max(8, initTop + dy), maxTop);
-        card.style.left = newLeft + "px";
-        card.style.top = newTop + "px";
-        card.style.right = "auto";
-        card.style.bottom = "auto";
-      };
-
-      const onPointerUp = (e) => {
-        if (!dragging) return;
-        dragging = false;
-        head.style.cursor = "grab";
-        try { head.releasePointerCapture(e.pointerId); } catch {}
-      };
-
-      head.addEventListener("pointerdown", onPointerDown);
-      head.addEventListener("pointermove", onPointerMove);
-      head.addEventListener("pointerup", onPointerUp);
-      head.addEventListener("pointercancel", onPointerUp);
-      window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
-    }
-
-    function makePinDraggable(pin, onDrop, onClick) {
-      pin.style.cursor = "grab";
-      pin.style.touchAction = "none";
-      pin.style.userSelect = "none";
-
-      let dragging = false;
-      let startX = 0;
-      let startY = 0;
-      let pX = 0;
-      let pY = 0;
+      let initCardLeft = 0;
+      let initCardTop = 0;
+      let initPinLeft = 0;
+      let initPinTop = 0;
       let hasMoved = false;
 
-      const onPointerDown = (e) => {
-        e.stopPropagation();
-        e.preventDefault();
+      const startDrag = (e) => {
         dragging = true;
         hasMoved = false;
         startX = e.clientX;
         startY = e.clientY;
-        pX = parseFloat(pin.style.left) || startX;
-        pY = parseFloat(pin.style.top) || startY;
-        pin.style.cursor = "grabbing";
-        try { pin.setPointerCapture(e.pointerId); } catch {}
+
+        const cardRect = card.getBoundingClientRect();
+        initCardLeft = cardRect.left;
+        initCardTop = cardRect.top;
+
+        if (pin) {
+          initPinLeft = parseFloat(pin.style.left) || 0;
+          initPinTop = parseFloat(pin.style.top) || 0;
+          pin.style.cursor = "grabbing";
+        }
+        head.style.cursor = "grabbing";
+
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+        e.preventDefault();
+        e.stopPropagation();
       };
 
-      const onPointerMove = (e) => {
+      const moveDrag = (e) => {
         if (!dragging) return;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
-        if (!hasMoved && Math.hypot(dx, dy) > 4) {
+
+        if (!hasMoved && Math.hypot(dx, dy) > 3) {
           hasMoved = true;
         }
+
         if (hasMoved) {
-          pin.style.left = (pX + dx) + "px";
-          pin.style.top = (pY + dy) + "px";
+          const w = card.offsetWidth || 340;
+          const h = card.offsetHeight || 200;
+          const maxLeft = Math.max(8, window.innerWidth - w - 8);
+          const maxTop = Math.max(8, window.innerHeight - h - 8);
+          card.style.left = Math.min(Math.max(8, initCardLeft + dx), maxLeft) + "px";
+          card.style.top = Math.min(Math.max(8, initCardTop + dy), maxTop) + "px";
+          card.style.right = "auto";
+          card.style.bottom = "auto";
+
+          if (pin) {
+            pin.style.left = (initPinLeft + dx) + "px";
+            pin.style.top = (initPinTop + dy) + "px";
+          }
         }
       };
 
-      const onPointerUp = async (e) => {
+      const endDrag = async (e) => {
         if (!dragging) return;
         dragging = false;
-        pin.style.cursor = "grab";
-        try { pin.releasePointerCapture(e.pointerId); } catch {}
-        if (!hasMoved) {
-          if (onClick) onClick(e);
-        } else {
-          if (onDrop) await onDrop(e.clientX, e.clientY);
+        head.style.cursor = "grab";
+        if (pin) pin.style.cursor = "grab";
+        try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+
+        if (hasMoved && pin && onDrop) {
+          const pinX = parseFloat(pin.style.left) || 0;
+          const pinY = parseFloat(pin.style.top) || 0;
+          await onDrop(pinX, pinY);
         }
       };
 
-      pin.addEventListener("pointerdown", onPointerDown);
-      pin.addEventListener("pointermove", onPointerMove);
-      pin.addEventListener("pointerup", onPointerUp);
-      pin.addEventListener("pointercancel", onPointerUp);
-      window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
+      head.addEventListener("pointerdown", (e) => {
+        if (e.target && e.target.closest("button, input, textarea, a, select")) return;
+        startDrag(e);
+      });
+      head.addEventListener("pointermove", moveDrag);
+      head.addEventListener("pointerup", endDrag);
+      head.addEventListener("pointercancel", endDrag);
+
+      if (pin) {
+        pin.addEventListener("pointerdown", startDrag);
+        pin.addEventListener("pointermove", moveDrag);
+        pin.addEventListener("pointerup", endDrag);
+        pin.addEventListener("pointercancel", endDrag);
+      }
+
+      window.addEventListener("pointermove", moveDrag);
+      window.addEventListener("pointerup", endDrag);
     }
 
     function placeCard(card, x, y) {
@@ -1566,10 +1554,12 @@
 
     function closeCards() {
       ui.layer.innerHTML = "";
+      ui.pins.querySelectorAll(".active-open").forEach((p) => p.classList.remove("active-open"));
       state.openThreadId = null;
       state.activeThreadRefresher = null;
       state.activeInboxRefresher = null;
       state.inboxOpen = false;
+      renderPins();
     }
 
     function openNewThreadCard(initialAnchor, initialContext, initialX, initialY) {
@@ -1579,26 +1569,13 @@
       let curX = initialX;
       let curY = initialY;
 
-      // Floating draggable placement pin marker
       const tempPin = document.createElement("div");
-      tempPin.className = "pinbtn newpin st-open";
+      tempPin.className = "pinbtn newpin st-open active-open";
       tempPin.textContent = "+";
       tempPin.style.left = curX + "px";
       tempPin.style.top = curY + "px";
-      tempPin.title = "Drag to move pin location";
+      tempPin.title = "Drag to move with comment box";
       ui.layer.appendChild(tempPin);
-
-      makePinDraggable(
-        tempPin,
-        async (dropX, dropY) => {
-          const res = anchorFromPoint(dropX, dropY);
-          curAnchor = res.anchor;
-          curContext = res.context;
-          curX = dropX;
-          curY = dropY;
-        },
-        null
-      );
 
       const card = document.createElement("div");
       card.className = "card";
@@ -1617,7 +1594,18 @@
         })
       );
       placeCard(card, initialX, initialY);
-      makeCardDraggable(card);
+
+      bindPairedDrag({
+        card,
+        pin: tempPin,
+        onDrop: async (pinX, pinY) => {
+          const res = anchorFromPoint(pinX, pinY);
+          curAnchor = res.anchor;
+          curContext = res.context;
+          curX = pinX;
+          curY = pinY;
+        },
+      });
     }
 
     async function openThreadCard(thread, x, y) {
@@ -1654,7 +1642,20 @@
         })
       );
       placeCard(card, x, y);
-      makeCardDraggable(card);
+      const activePin = ui.pins.querySelector(`[data-thread-id="${thread.id}"]`);
+      if (activePin) activePin.classList.add("active-open");
+
+      bindPairedDrag({
+        card,
+        pin: activePin,
+        onDrop: async (pinX, pinY) => {
+          const res = anchorFromPoint(pinX, pinY);
+          thread.data.anchor = res.anchor;
+          thread.data.context = res.context;
+          thread.data.lastActivityAt = now();
+          await adapter.updateThreadData(thread.id, thread.data);
+        },
+      });
 
       const fill = async () => {
         const comments = await adapter.listComments(thread.id);
@@ -1705,23 +1706,13 @@
         const st = t.data?.status || "open";
         const meta = getStatusMeta(st);
         const pin = document.createElement("button");
-        pin.className = "pinbtn " + meta.class;
+        pin.className = "pinbtn " + meta.class + (state.openThreadId === t.id ? " active-open" : "");
+        pin.dataset.threadId = t.id;
         pin.textContent = String(i + 1);
         pin.style.left = p.x + "px";
         pin.style.top = p.y + "px";
-        pin.title = "[" + meta.label + "] " + (t.data?.preview || "") + " (Drag to move)";
-        makePinDraggable(
-          pin,
-          async (dropX, dropY) => {
-            const { anchor, context } = anchorFromPoint(dropX, dropY);
-            t.data.anchor = anchor;
-            t.data.context = context;
-            t.data.lastActivityAt = now();
-            await adapter.updateThreadData(t.id, t.data);
-            renderPins();
-          },
-          () => openThreadCard(t, p.x, p.y)
-        );
+        pin.title = "[" + meta.label + "] " + (t.data?.preview || "");
+        pin.addEventListener("click", () => openThreadCard(t, p.x, p.y));
         ui.pins.appendChild(pin);
       });
     }
@@ -1812,7 +1803,7 @@
       };
       tabs.forEach((b) => b.addEventListener("click", () => showTab(b.dataset.t)));
       ui.layer.appendChild(card);
-      makeCardDraggable(card);
+      bindPairedDrag({ card });
       state.activeInboxRefresher = (tab) => showTab(tab, true);
       await showTab(state.inboxTab);
     }
