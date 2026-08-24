@@ -959,8 +959,29 @@
       .bar > button { height: 32px; padding: 0 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; color: #b6b8bf; justify-content: center; }
       .bar > button:hover { background: #1c1e24; color: #fff; }
       .bar > button.active { background: #f59e0b; color: #16130a; }
-      .bar .badge { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
-        color: #16130a; font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+      .bar .badge { min-width: 17px; height: 17px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
+        color: #16130a; font-size: 10px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; transition: all .2s; }
+      .bar .badge.is-working {
+        background: #0284c7;
+        color: #ffffff;
+        animation: psBadgePulseBlue 1.3s infinite ease-in-out;
+      }
+      .bar .badge.is-deploying {
+        background: #9333ea;
+        color: #ffffff;
+        animation: psBadgePulsePurple 1.3s infinite ease-in-out;
+      }
+
+      @keyframes psBadgePulseBlue {
+        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(2, 132, 199, 0.8); }
+        50% { transform: scale(1.22); box-shadow: 0 0 0 6px rgba(2, 132, 199, 0); }
+        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(2, 132, 199, 0); }
+      }
+      @keyframes psBadgePulsePurple {
+        0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.8); }
+        50% { transform: scale(1.22); box-shadow: 0 0 0 6px rgba(147, 51, 234, 0); }
+        100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(147, 51, 234, 0); }
+      }
       .dot { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); width: 34px; height: 34px;
         border-radius: 999px; background: #0e0f13; color: #fbbf24; border: 1px solid #2a2c33; pointer-events: auto;
         justify-content: center; box-shadow: 0 8px 30px rgba(0,0,0,.35); }
@@ -1770,11 +1791,11 @@
     function getStatusMeta(status) {
       switch (status) {
         case "in_progress":
-          return { key: "in_progress", label: "Agent fixing…", class: "st-in-progress" };
+          return { key: "in_progress", label: "In Progress", class: "st-in-progress" };
         case "deploying":
           return { key: "deploying", label: "Deploying…", class: "st-deploying" };
         case "deployed":
-          return { key: "deployed", label: "Deployed · Ready to test", class: "st-deployed" };
+          return { key: "deployed", label: "Deployed", class: "st-deployed" };
         case "resolved":
           return { key: "resolved", label: "Resolved", class: "st-resolved" };
         case "open":
@@ -1942,8 +1963,12 @@
       comment.addEventListener("click", () => setMode(state.mode === "comment" ? "idle" : "comment"));
       bar.appendChild(comment);
 
+      const hasWorking = state.threads.some((t) => t.data?.status === "in_progress" || t.data?.status === "deploying");
+      const hasDeploying = state.threads.some((t) => t.data?.status === "deploying");
+      const badgeCls = "badge" + (hasDeploying ? " is-deploying" : hasWorking ? " is-working" : "");
+
       const inbox = document.createElement("button");
-      inbox.innerHTML = svg("inbox", 14) + `<span>Issues</span>${state.threads.length ? `<span class="badge">${state.threads.length}</span>` : ""}`;
+      inbox.innerHTML = svg("inbox", 14) + `<span>Issues</span>${state.threads.length ? `<span class="${badgeCls}">${state.threads.length}</span>` : ""}`;
       inbox.title = "All reported issues";
       inbox.addEventListener("click", () => {
         state.inboxOpen = !state.inboxOpen;
