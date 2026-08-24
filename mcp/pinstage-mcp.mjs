@@ -33,6 +33,7 @@
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { execSync } from "node:child_process";
 
 /* ── config ────────────────────────────────────────────────────────────────── */
 
@@ -55,6 +56,23 @@ const T_COMMENTS = env.PINSTAGE_TABLE_COMMENTS || "feedbackComments";
 if (!URL_BASE || !KEY) {
   console.error("pinstage-mcp: missing PINSTAGE_SUPABASE_URL / PINSTAGE_SERVICE_KEY (or --env-file with NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)");
   process.exit(1);
+}
+
+/* GitHub Issues mirror (optional): PINSTAGE_GITHUB_REPO="owner/repo".
+ * Token: PINSTAGE_GITHUB_TOKEN → GITHUB_TOKEN → `gh auth token`.
+ * PINSTAGE_APP_URL (e.g. the staging origin) makes issue bodies carry a
+ * deep link back to the exact pin. */
+const GH_REPO = env.PINSTAGE_GITHUB_REPO || null;
+const APP_URL = (env.PINSTAGE_APP_URL || "").replace(/\/$/, "");
+
+function ghToken() {
+  if (env.PINSTAGE_GITHUB_TOKEN) return env.PINSTAGE_GITHUB_TOKEN;
+  if (env.GITHUB_TOKEN) return env.GITHUB_TOKEN;
+  try {
+    return execSync("gh auth token", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return null;
+  }
 }
 
 /* ── Pinstage store (PostgREST, service role) ──────────────────────────────── */
@@ -123,6 +141,101 @@ async function threadDetail(id) {
     for (const a of c.attachments ?? []) lines.push(`    [screenshot] ${a.url}`);
   }
   return lines.join("\n");
+}
+
+/* ── GitHub Issues one-way mirror ──────────────────────────────────────────── */
+/*  Pinstage stays the primary store (the toolbar needs instant, session-
+ *  authenticated writes); GitHub is the portable mirror: thread → issue,
+ *  reply → issue comment, resolve/reopen → close/reopen. Sync state rides on
+ *  the thread (data.github = {repo, number, url, syncedComments,
+ *  syncedStatus}), so the sync is incremental and idempotent.               */
+
+async function gh(pathname, init = {}) {
+  const token = ghToken();
+  if (!token) throw new Error("no GitHub token (PINSTAGE_GITHUB_TOKEN, GITHUB_TOKEN, or `gh auth login`)");
+  const res = await fetch("https://api.github.com" + pathname, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "pinstage-mcp",
+      ...init.headers,
+    },
+  });
+  if (!res.ok) throw new Error(`GitHub ${res.status} ${await res.text()}`);
+  return res.status === 204 ? null : res.json();
+}
+
+const ghCommentBody = (c) => {
+  let body = `**${c.authorName ?? "?"}** (${when(c.createdAt)}):\n\n${c.body ?? ""}`;
+  for (const a of c.attachments ?? []) body += `\n\n![screenshot](${a.url})`;
+  return body;
+};
+
+async function syncGithub(repo = GH_REPO) {
+  if (!repo) throw new Error("set PINSTAGE_GITHUB_REPO (owner/repo) or pass `repo`");
+  const rows = await rest(`${T_THREADS}?select=id,data&limit=300`);
+  const actions = [];
+
+  for (const t of rows) {
+    const d = t.data;
+    if (DEFAULT_PROJECT && d.project && d.project !== DEFAULT_PROJECT) continue;
+    const cs = (await comments(t.id)).map((c) => c.data);
+    let g = d.github ? { ...d.github } : null;
+
+    if (!g) {
+      const meta = [
+        `**Page:** \`${d.path ?? "?"}${d.query ?? ""}\``,
+        `**Reported by:** ${d.createdBy?.name ?? "?"} — ${when(d.createdAt)}`,
+        `**Build:** v${d.appVersion ?? "?"} · ${d.viewport ?? "?"}`,
+      ];
+      if (APP_URL) {
+        const sep = d.query ? "&" : "?";
+        meta.push(`**Open on the app:** ${APP_URL}${d.path ?? "/"}${d.query ?? ""}${sep}mdthread=${t.id}`);
+      }
+      let body = meta.join("\n") + "\n";
+      const first = cs[0];
+      if (first?.body) body += `\n> ${String(first.body).split("\n").join("\n> ")}\n`;
+      for (const a of first?.attachments ?? []) body += `\n![screenshot](${a.url})\n`;
+      body += `\n---\n_Synced from [Pinstage](https://github.com/teminali/pinstage) · thread \`${t.id}\`_`;
+
+      const payload = { title: `${d.preview || "Pinstage issue"} (${d.path ?? "?"})`, body };
+      let issue;
+      try {
+        issue = await gh(`/repos/${repo}/issues`, {
+          method: "POST",
+          body: JSON.stringify({ ...payload, labels: ["pinstage", d.project].filter(Boolean) }),
+        });
+      } catch {
+        issue = await gh(`/repos/${repo}/issues`, { method: "POST", body: JSON.stringify(payload) });
+      }
+      g = { repo, number: issue.number, url: issue.html_url, syncedComments: Math.min(1, cs.length), syncedStatus: "open" };
+      actions.push(`created ${repo}#${issue.number} for thread ${t.id}`);
+    }
+
+    for (const c of cs.slice(g.syncedComments)) {
+      await gh(`/repos/${g.repo}/issues/${g.number}/comments`, { method: "POST", body: JSON.stringify({ body: ghCommentBody(c) }) });
+    }
+    if (cs.length > g.syncedComments) {
+      actions.push(`${cs.length - g.syncedComments} comment(s) → ${g.repo}#${g.number}`);
+      g.syncedComments = cs.length;
+    }
+
+    const status = d.status === "resolved" ? "resolved" : "open";
+    if (status !== g.syncedStatus) {
+      await gh(`/repos/${g.repo}/issues/${g.number}`, {
+        method: "PATCH",
+        body: JSON.stringify(status === "resolved" ? { state: "closed", state_reason: "completed" } : { state: "open" }),
+      });
+      actions.push(`${g.repo}#${g.number} → ${status === "resolved" ? "closed" : "reopened"}`);
+      g.syncedStatus = status;
+    }
+
+    if (JSON.stringify(d.github) !== JSON.stringify(g)) await patchThread(t.id, { ...d, github: g });
+  }
+
+  return actions.length ? actions.join("\n") : "Everything already in sync.";
 }
 
 /* ── tools ─────────────────────────────────────────────────────────────────── */
@@ -224,7 +337,31 @@ const TOOLS = [
       return `Reopened ${id}.`;
     },
   },
+  {
+    name: "pinstage_sync_github",
+    description:
+      "Mirror the Pinstage queue to GitHub Issues (one-way, incremental, idempotent): new threads become issues (screenshots inline, deep link back to the pin), new replies become issue comments, resolved/reopened states close/reopen the issue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "owner/repo" + (GH_REPO ? ` (default ${GH_REPO})` : " (required — no PINSTAGE_GITHUB_REPO configured)") },
+      },
+    },
+    handler: async ({ repo }) => syncGithub(repo || GH_REPO),
+  },
 ];
+
+/* ── CLI mode: `node pinstage-mcp.mjs sync-github` (for cron / CI) ─────────── */
+
+if (process.argv.includes("sync-github")) {
+  try {
+    console.log(await syncGithub());
+    process.exit(0);
+  } catch (e) {
+    console.error("sync-github failed:", e.message);
+    process.exit(1);
+  }
+}
 
 /* ── MCP over stdio (newline-delimited JSON-RPC 2.0) ───────────────────────── */
 
@@ -249,7 +386,7 @@ rl.on("line", async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "pinstage-mcp", version: "0.3.0" },
+        serverInfo: { name: "pinstage-mcp", version: "0.4.0" },
       });
     } else if (method === "notifications/initialized" || method?.startsWith("notifications/")) {
       // notifications need no response

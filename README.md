@@ -170,6 +170,27 @@ Config via env (or the `--env-file`): `PINSTAGE_SUPABASE_URL` /
 stamped on the agent's replies. The service key stays inside the MCP process;
 the agent only ever sees tool results.
 
+## GitHub Issues mirror (portability)
+
+Pinstage stays the primary store — the toolbar needs instant,
+session-authenticated writes — but the queue can **mirror one-way to GitHub
+Issues** so your issues live where boards, CI, and every other tool already
+look: a thread becomes an issue (screenshots render inline, plus a deep link
+back to the exact pin), each reply becomes an issue comment, and
+resolve/reopen closes/reopens the issue. The sync is incremental and
+idempotent (state rides on the thread), and runs wherever credentials live:
+
+```bash
+# as an agent tool: pinstage_sync_github
+# or from cron / CI:
+PINSTAGE_GITHUB_REPO=owner/repo node mcp/pinstage-mcp.mjs sync-github \
+  --env-file /path/to/your-app/.env.local
+```
+
+Token resolution: `PINSTAGE_GITHUB_TOKEN` → `GITHUB_TOKEN` → `gh auth token`.
+Set `PINSTAGE_APP_URL` so issue bodies deep-link back to the pin. The same
+pattern extends to Linear/Jira mirrors later.
+
 ## Building a dashboard on top
 
 Pinstage deliberately has no server of its own, so "the API" is your data
