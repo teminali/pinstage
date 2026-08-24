@@ -158,7 +158,12 @@ claude mcp add pinstage -- node /path/to/pinstage/mcp/pinstage-mcp.mjs \
 ```
 
 The service key stays inside the MCP process. The agent only sees tool
-results. Configuration is documented at the top of the file.
+results.
+
+**Full guide: [mcp/README.md](mcp/README.md)** covers setup for Claude Code,
+Codex, and Cursor, the complete configuration reference, every tool, the
+recommended team workflow, cron usage, the security model, and
+troubleshooting.
 
 ## GitHub Issues mirror
 
