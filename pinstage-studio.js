@@ -166,12 +166,18 @@
       };
     },
 
+    /** The file, or null when it is simply not there — a missing optional
+     *  sidecar is an ordinary state, not an exception to propagate. */
     async read(id, name) {
       if (!this.supported) return null;
-      const dir = await this.dir();
-      const sub = await dir.getDirectoryHandle(id);
-      const handle = await sub.getFileHandle(name);
-      return handle.getFile();
+      try {
+        const dir = await this.dir();
+        const sub = await dir.getDirectoryHandle(id);
+        const handle = await sub.getFileHandle(name);
+        return await handle.getFile();
+      } catch (e) {
+        return null;
+      }
     },
 
     async list() {
@@ -184,7 +190,33 @@
           const meta = await (await (await handle.getFileHandle("meta.json")).getFile()).text();
           out.push({ id: name, meta: JSON.parse(meta) });
         } catch (e) {
-          /* a recording still being written, or a half-removed one */
+          // No meta.json means the recording never finished writing one. The
+          // VIDEO is still there, though, and losing hours of capture because
+          // a sidecar failed would be indefensible — so it is reconstructed
+          // from what exists and flagged as recovered.
+          try {
+            const f = await (await handle.getFileHandle("screen.webm")).getFile();
+            if (!f.size) continue;
+            out.push({
+              id: name,
+              recovered: true,
+              meta: {
+                id: name,
+                startedAt: f.lastModified || Date.now(),
+                durationMs: 0,
+                width: 0,
+                height: 0,
+                fps: 30,
+                bytes: f.size,
+                hasCursorTrack: false,
+                hasCamera: false,
+                hasAudio: false,
+                recovered: true,
+              },
+            });
+          } catch (e2) {
+            /* genuinely empty, or half-removed */
+          }
         }
       }
       return out.sort((a, b) => (b.meta.startedAt || 0) - (a.meta.startedAt || 0));
@@ -820,15 +852,48 @@
       },
       pause: () => rec.state === "recording" && rec.pause(),
       resume: () => rec.state === "paused" && rec.resume(),
+      /**
+       * Close the file, and refuse to hang doing it.
+       *
+       * `rec.stop()` throws InvalidStateError when the recorder has ALREADY
+       * stopped — which happens routinely, because ending the share from
+       * Chrome's own bar stops it for us. Thrown inside a Promise executor
+       * that rejection had nowhere to go, so the UI sat on "Finishing the
+       * recording…" for ever with the bytes safely on disk and no way to
+       * reach them. Every step here is now guarded and time-boxed: a
+       * recording is never lost to its own teardown.
+       */
       async finish() {
         if (rec.state !== "inactive") {
-          await new Promise((res) => {
-            rec.addEventListener("stop", res, { once: true });
-            rec.stop();
+          await new Promise((resolve) => {
+            let done = false;
+            const finishOnce = () => {
+              if (done) return;
+              done = true;
+              resolve();
+            };
+            rec.addEventListener("stop", finishOnce, { once: true });
+            rec.addEventListener("error", finishOnce, { once: true });
+            // A 'stop' event that never arrives must not be fatal — the data
+            // already written is still a valid recording.
+            setTimeout(finishOnce, 8000);
+            try {
+              rec.stop();
+            } catch (e) {
+              finishOnce();
+            }
           });
         }
-        await queue;
-        await writer.close();
+        try {
+          await queue;
+        } catch (e) {
+          /* a dropped chunk is already counted; the rest of the file stands */
+        }
+        try {
+          await writer.close();
+        } catch (e) {
+          /* already closed, or the handle went away */
+        }
         return writer.fallback ? writer.blob(mime) : writer.file();
       },
     };
@@ -925,12 +990,18 @@
         screen.resume();
         if (cameraRec) cameraRec.resume();
       },
-      async stop() {
+      async stop(onStep) {
+        const step = (m) => onStep && onStep(m);
         if (paused) session.resume();
         if (track) track.stop();
         const durationMs = elapsed();
+        step("Closing the screen recording · " + formatBytes(screen.bytes));
         const files = { screen: await screen.finish() };
-        if (cameraRec) files.camera = await cameraRec.finish();
+        if (cameraRec) {
+          step("Closing the webcam recording");
+          files.camera = await cameraRec.finish();
+        }
+        step("Releasing the capture");
         cap.stop();
         dispatchEvent(new CustomEvent("pinstage:recording", { detail: { active: false } }));
 
@@ -958,9 +1029,11 @@
           bitrate: screenBitrate,
           droppedChunks: screen.dropped + (cameraRec ? cameraRec.dropped : 0),
         };
+        step("Writing the pointer track");
         await store.writeJson(id, "track.json", data);
         await store.writeJson(id, "meta.json", meta);
         await store.writeJson(id, "manifest.json", buildManifest(meta));
+        step("Done");
         return { meta, track: data, files };
       },
     };
@@ -2838,16 +2911,78 @@
   }
 
   /** Reopen a recording from disk as if it had just been made. */
+  /**
+   * Ask the video itself what it is. Needed for a recording whose sidecar
+   * files never got written — the picture is the authority anyway, and this is
+   * how one recovers from a teardown that failed.
+   */
+  function probeVideo(file) {
+    return new Promise((resolve) => {
+      const v = document.createElement("video");
+      v.preload = "metadata";
+      v.muted = true;
+      const url = URL.createObjectURL(file);
+      let settled = false;
+      const done = (r) => {
+        if (settled) return;
+        settled = true;
+        URL.revokeObjectURL(url);
+        resolve(r);
+      };
+      v.addEventListener("loadedmetadata", () =>
+        done({
+          width: v.videoWidth || 0,
+          height: v.videoHeight || 0,
+          durationMs: isFinite(v.duration) ? v.duration * 1000 : 0,
+        })
+      );
+      v.addEventListener("error", () => done(null));
+      setTimeout(() => done(null), 8000);
+      v.src = url;
+    });
+  }
+
   async function openRecording(id) {
+    const screenEarly = await store.read(id, "screen.webm");
+    if (!screenEarly) throw new Error("That recording's video file is missing.");
     const metaFile = await store.read(id, "meta.json");
-    if (!metaFile) throw new Error("That recording is no longer on disk.");
-    const meta = JSON.parse(await metaFile.text());
+    let meta;
+    if (metaFile) {
+      meta = JSON.parse(await metaFile.text());
+    } else {
+      // Recovered: no sidecar, so the file is asked directly.
+      const probed = await probeVideo(screenEarly);
+      if (!probed || !probed.durationMs) throw new Error("That recording could not be read back.");
+      meta = {
+        id,
+        startedAt: screenEarly.lastModified || Date.now(),
+        durationMs: probed.durationMs,
+        width: probed.width,
+        height: probed.height,
+        fps: 30,
+        bytes: screenEarly.size,
+        hasCursorTrack: false,
+        hasCamera: false,
+        hasAudio: true,
+        recovered: true,
+      };
+      await store.writeJson(id, "meta.json", meta).catch(() => {});
+    }
+    // A duration of zero means the sidecar was written before the file closed.
+    if (!meta.durationMs || !meta.width) {
+      const probed = await probeVideo(screenEarly);
+      if (probed && probed.durationMs) {
+        meta.durationMs = meta.durationMs || probed.durationMs;
+        meta.width = meta.width || probed.width;
+        meta.height = meta.height || probed.height;
+        await store.writeJson(id, "meta.json", meta).catch(() => {});
+      }
+    }
     const trackFile = await store.read(id, "track.json");
     const track = trackFile
       ? JSON.parse(await trackFile.text())
       : { moves: [], clicks: [], keys: [], scrolls: [], surface: { w: meta.width, h: meta.height, dpr: 1 } };
-    const screen = await store.read(id, "screen.webm");
-    if (!screen) throw new Error("That recording's video file is missing.");
+    const screen = screenEarly;
     let camera = null;
     try {
       camera = await store.read(id, "camera.webm");
@@ -3305,6 +3440,7 @@
               h("div", { class: "nm" }, [name]),
               h("div", { class: "mt" }, [
                 when + " · " + formatBytes(r.meta.bytes || 0) +
+                (r.meta.recovered ? " · recovered" : "") +
                 (r.project && r.project.exports && r.project.exports.length ? " · saved" : ""),
               ]),
             ]),
@@ -3418,12 +3554,35 @@
     }
 
     /* ── 3. stop, then edit ── */
+    let finishing = false;
     async function finish() {
+      // Chrome's own "Stop sharing" bar and our Stop button can both land here,
+      // and the first of them stops the tracks, which fires the other.
+      if (finishing) return;
       if (!session) return teardown();
+      finishing = true;
       const s = session;
       session = null;
-      sheet([h("h2", {}, ["Finishing the recording…"]), h("p", { class: "sub" }, ["Flushing the last chunks to disk."])]);
-      const result = await s.stop();
+      const line = h("p", { class: "sub" }, ["Closing the file."]);
+      sheet([h("h2", {}, ["Finishing the recording…"]), line]);
+
+      let result;
+      try {
+        result = await s.stop((msg) => (line.textContent = msg));
+      } catch (e) {
+        // The bytes are on disk even when the teardown failed, so offer them
+        // rather than dropping the whole recording on the floor.
+        finishing = false;
+        sheet([
+          h("h2", {}, ["The recording did not close cleanly"]),
+          h("p", { class: "sub" }, [String((e && e.message) || e)]),
+          h("p", { class: "sub" }, ["What was captured is still on disk and should open from the list."]),
+          h("button", { class: "cta", onclick: () => preflight() }, ["Back to recordings"]),
+          h("button", { class: "cta ghost", onclick: teardown }, ["Close"]),
+        ]);
+        return;
+      }
+      finishing = false;
       if (result.meta.durationMs < 700) {
         await store.remove(result.meta.id).catch(() => {});
         sheet([
