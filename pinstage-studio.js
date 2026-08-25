@@ -526,6 +526,65 @@
    * single AudioContext) because nobody wants to re-sync two audio files.
    */
 
+  /* ── cameras ─────────────────────────────────────────────────────────────
+   * A Mac with an iPhone on the desk has at least three cameras, and the OS
+   * picks the wrong one often enough that "use my phone" is a real request.
+   * Device labels are hidden until camera permission has been granted at least
+   * once, so the list is enumerated AFTER a permission probe rather than before
+   * — otherwise every entry reads "camera" and the picker is useless.
+   */
+  function classifyCamera(label) {
+    const l = (label || "").toLowerCase();
+    if (/iphone|ipad|continuity/.test(l)) return "continuity";
+    if (/obs|virtual|camo|snap|manycam|droidcam/.test(l)) return "virtual";
+    if (/facetime|built-?in|integrated|internal/.test(l)) return "builtin";
+    return "external";
+  }
+
+  const CAMERA_KIND_LABEL = {
+    continuity: "iPhone",
+    builtin: "Built in",
+    external: "USB",
+    virtual: "Virtual",
+  };
+
+  async function listCameras() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+    let devices = await navigator.mediaDevices.enumerateDevices();
+    let cams = devices.filter((d) => d.kind === "videoinput");
+    // Empty labels mean permission has never been granted. One throwaway
+    // getUserMedia reveals them; it is stopped immediately.
+    if (cams.length && cams.every((d) => !d.label)) {
+      let probe = null;
+      try {
+        probe = await navigator.mediaDevices.getUserMedia({ video: true });
+        devices = await navigator.mediaDevices.enumerateDevices();
+        cams = devices.filter((d) => d.kind === "videoinput");
+      } catch (e) {
+        return cams.map((d, i) => ({
+          id: d.deviceId,
+          label: "Camera " + (i + 1),
+          kind: "external",
+          needsPermission: true,
+        }));
+      } finally {
+        if (probe) probe.getTracks().forEach((t) => t.stop());
+      }
+    }
+    return cams.map((d, i) => ({
+      id: d.deviceId,
+      label: d.label || "Camera " + (i + 1),
+      kind: classifyCamera(d.label),
+    }));
+  }
+
+  /** Fires when a camera appears or disappears — an iPhone waking up nearby. */
+  function onCameraChange(fn) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.addEventListener) return () => {};
+    navigator.mediaDevices.addEventListener("devicechange", fn);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", fn);
+  }
+
   const CODECS = [
     'video/webm;codecs="vp9,opus"',
     'video/webm;codecs="vp8,opus"',
@@ -546,7 +605,7 @@
 
   async function startCapture(opts) {
     const o = Object.assign(
-      { source: "tab", mic: true, systemAudio: false, camera: false, fps: 30 },
+      { source: "tab", mic: true, systemAudio: false, camera: false, cameraDeviceId: null, fps: 30 },
       opts || {}
     );
 
@@ -580,13 +639,20 @@
 
     let camera = null;
     if (o.camera) {
+      const want = { width: { ideal: 1280 }, height: { ideal: 720 } };
+      if (o.cameraDeviceId) want.deviceId = { exact: o.cameraDeviceId };
+      else want.facingMode = "user";
       try {
-        camera = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-          audio: false,
-        });
+        camera = await navigator.mediaDevices.getUserMedia({ video: want, audio: false });
       } catch (e) {
-        camera = null; // a refused webcam must not lose the whole recording
+        // The chosen camera can vanish between picking it and starting — an
+        // iPhone that locked, a USB cam unplugged. Fall back to any camera
+        // rather than lose the whole recording over the webcam.
+        try {
+          camera = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        } catch (e2) {
+          camera = null;
+        }
       }
     }
 
@@ -1801,6 +1867,11 @@
 
     const st = Object.assign({}, STYLE_DEFAULTS, style || {});
     const fps = opts.fps || Math.min(60, Math.round(meta.fps || 30));
+    const trim = {
+      start: Math.max(0, (opts.trim && opts.trim.start) || 0),
+      end: (opts.trim && opts.trim.end) || meta.durationMs || Infinity,
+    };
+    const trimmedMs = Math.max(1, trim.end - trim.start);
 
     // Output dimensions are NOT settled here. `meta` came from getSettings() at
     // the instant the stream arrived — before a frame existed — and a tab
@@ -1862,6 +1933,12 @@
         framesIn++;
         try {
           const t = frame.timestamp / 1000;
+          // Frames outside the trim still had to be DECODED — a cut rarely
+          // lands on a keyframe — but they are not part of the film.
+          if (t < trim.start || t > trim.end) {
+            frame.close();
+            return;
+          }
           const camSrc = camera ? await camera.at(t) : null;
           renderFrame(ctx, {
             W: outW,
@@ -1879,7 +1956,12 @@
           // paying for one on every frame.
           const forceKey = t - lastKeyMs >= 2000;
           if (forceKey) lastKeyMs = t;
-          const out = new VideoFrame(canvas, { timestamp: frame.timestamp, duration: 1e6 / fps });
+          // Rendered at the ORIGINAL time (the camera track and the cursor are
+          // in original time), but stamped rebased so the output starts at zero.
+          const out = new VideoFrame(canvas, {
+            timestamp: Math.round((t - trim.start) * 1000),
+            duration: 1e6 / fps,
+          });
           encoder.encode(out, { keyFrame: forceKey });
           out.close();
           framesOut++;
@@ -1894,6 +1976,7 @@
 
     let configured = false;
     let firstVideoMs = null;
+    const leadIn = []; // packets from the last keyframe before the in point
 
     while (true) {
       if (shouldCancel && shouldCancel()) {
@@ -1904,9 +1987,12 @@
       if (!p) break;
 
       if (p.kind === "audio") {
-        // Straight through, never re-encoded.
-        if (muxer && audioReady) muxer.addAudio(p.timeMs - (firstVideoMs || 0), p.data);
-        else pendingAudio.push(p);
+        // Straight through, never re-encoded — but only the part that survives
+        // the trim, rebased to the new zero.
+        if (muxer && audioReady) {
+          const at = p.timeMs - (firstVideoMs || 0);
+          if (at >= trim.start && at <= trim.end) muxer.addAudio(at - trim.start, p.data);
+        } else pendingAudio.push(p);
         continue;
       }
       if (p.kind !== "video") continue;
@@ -1939,19 +2025,36 @@
       }
 
       if (firstVideoMs == null) firstVideoMs = p.timeMs;
-      // Timestamps are rebased so the output starts at zero even when the
-      // recording's first packet does not.
-      const tsUs = Math.round((p.timeMs - firstVideoMs) * 1000);
-      decoder.decode(
-        new EncodedVideoChunk({
-          type: p.keyframe ? "key" : "delta",
-          timestamp: tsUs,
-          data: p.data,
-        })
-      );
+      const at = p.timeMs - firstVideoMs;
+      // Past the out point there is nothing left worth decoding.
+      if (at > trim.end) break;
+
+      const chunk = new EncodedVideoChunk({
+        type: p.keyframe ? "key" : "delta",
+        timestamp: Math.round(at * 1000),
+        data: p.data,
+      });
+
+      if (at < trim.start) {
+        // Before the in point. A cut almost never lands on a keyframe, so the
+        // frames from the last keyframe onwards still have to be decoded for
+        // the first kept frame to be whole — but nothing before that keyframe
+        // is worth touching, which is what makes trimming an hour in cheap.
+        if (p.keyframe) leadIn.length = 0;
+        leadIn.push(chunk);
+        continue;
+      }
+      if (leadIn.length) {
+        leadIn.forEach((c) => decoder.decode(c));
+        leadIn.length = 0;
+      }
+      decoder.decode(chunk);
 
       if (pendingAudio.length && audioReady) {
-        pendingAudio.splice(0).forEach((a) => muxer.addAudio(a.timeMs - firstVideoMs, a.data));
+        pendingAudio.splice(0).forEach((a) => {
+          const t = a.timeMs - firstVideoMs;
+          if (t >= trim.start && t <= trim.end) muxer.addAudio(t - trim.start, a.data);
+        });
       }
 
       // Backpressure: let the decoder and encoder catch up rather than queueing
@@ -1962,17 +2065,13 @@
       await flushSink();
 
       if (onProgress && framesIn % 15 === 0) {
-        const ratio = clamp(
-          meta.durationMs ? (p.timeMs - firstVideoMs) / meta.durationMs : 0,
-          0,
-          0.999
-        );
+        const ratio = clamp((p.timeMs - firstVideoMs - trim.start) / trimmedMs, 0, 0.999);
         const secs = (performance.now() - started) / 1000;
         onProgress({
           phase: "render",
           ratio,
           fps: framesOut / Math.max(0.001, secs),
-          speed: ratio * (meta.durationMs / 1000) / Math.max(0.001, secs),
+          speed: (ratio * (trimmedMs / 1000)) / Math.max(0.001, secs),
           eta: ratio > 0.01 ? (secs / ratio) * (1 - ratio) : null,
         });
       }
@@ -2007,7 +2106,7 @@
         height: outH,
         fps,
         frames: framesOut,
-        durationMs: meta.durationMs,
+        durationMs: trimmedMs,
         bytes: file.size,
         codec: picked.id,
         tookMs: performance.now() - started,
@@ -2015,120 +2114,280 @@
     };
   }
 
+  /* ── projects ────────────────────────────────────────────────────────────
+   * A recording and the edit made of it are separate things. The recording is
+   * immovable — megabytes of encoded video in OPFS. The edit is a few kilobytes
+   * of JSON describing what to do with it: where to trim, where the camera
+   * moves, how the frame is dressed.
+   *
+   * Keeping them apart is what makes everything else possible. The edit can be
+   * autosaved on every slider drag without touching the media, reopened weeks
+   * later, rendered again at a different size, or — the point of the MCP bridge
+   * — written by an agent that has never seen a single frame.
+   */
+
+  const PROJECT_VERSION = 2;
+
+  function newProject(rec) {
+    return {
+      version: PROJECT_VERSION,
+      id: rec.meta.id,
+      name: "Recording " + new Date(rec.meta.startedAt).toLocaleString(undefined, {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      }),
+      createdAt: rec.meta.startedAt,
+      updatedAt: Date.now(),
+      durationMs: rec.meta.durationMs,
+      // The whole edit, in one object an agent can read and patch.
+      edit: {
+        trim: { start: 0, end: rec.meta.durationMs },
+        style: JSON.parse(JSON.stringify(STYLE_DEFAULTS)),
+        segments: [],
+        overlays: [],
+      },
+      output: { width: Math.min(1920, rec.meta.width || 1920) },
+      exports: [],
+    };
+  }
+
+  /** Bring a project forward without losing what the user already set. */
+  function migrateProject(p, rec) {
+    if (!p || typeof p !== "object") return newProject(rec);
+    const fresh = newProject(rec);
+    const e = p.edit || {};
+    return {
+      ...fresh,
+      ...p,
+      version: PROJECT_VERSION,
+      edit: {
+        trim: e.trim || fresh.edit.trim,
+        style: Object.assign({}, fresh.edit.style, e.style || {}),
+        segments: Array.isArray(e.segments) ? e.segments : [],
+        overlays: Array.isArray(e.overlays) ? e.overlays : [],
+      },
+      output: Object.assign({}, fresh.output, p.output || {}),
+      exports: Array.isArray(p.exports) ? p.exports : [],
+    };
+  }
+
+  async function saveProject(project) {
+    project.updatedAt = Date.now();
+    await store.writeJson(project.id, "project.json", project);
+    // Anything watching — another tab, the MCP sync — hears about it here.
+    dispatchEvent(new CustomEvent("pinstage:project-saved", { detail: { id: project.id } }));
+    return project;
+  }
+
+  async function loadProject(id) {
+    try {
+      const f = await store.read(id, "project.json");
+      return f ? JSON.parse(await f.text()) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Every recording still on disk, newest first, with its edit and enough
+   * metadata to show a row without opening the media.
+   */
+  async function listRecordings() {
+    const rows = await store.list();
+    const out = [];
+    for (const r of rows) {
+      const project = await loadProject(r.id);
+      out.push({ id: r.id, meta: r.meta, project });
+    }
+    return out;
+  }
+
+  /** Reopen a recording from disk as if it had just been made. */
+  async function openRecording(id) {
+    const metaFile = await store.read(id, "meta.json");
+    if (!metaFile) throw new Error("That recording is no longer on disk.");
+    const meta = JSON.parse(await metaFile.text());
+    const trackFile = await store.read(id, "track.json");
+    const track = trackFile
+      ? JSON.parse(await trackFile.text())
+      : { moves: [], clicks: [], keys: [], scrolls: [], surface: { w: meta.width, h: meta.height, dpr: 1 } };
+    const screen = await store.read(id, "screen.webm");
+    if (!screen) throw new Error("That recording's video file is missing.");
+    let camera = null;
+    try {
+      camera = await store.read(id, "camera.webm");
+    } catch (e) {
+      /* no webcam on this one */
+    }
+    return { meta, track, files: { screen, camera } };
+  }
+
   /* ── UI ──────────────────────────────────────────────────────────────────
-   * Everything lives in one shadow root so the host application's CSS cannot
-   * reach it and it cannot reach the host's. That matters more here than in the
-   * rest of the toolbar: this panel is open on top of whatever app is being
-   * recorded, and a leaked `* { box-sizing }` from either direction would show
-   * up in the finished video.
+   * One shadow root, so the host application's CSS cannot reach in and this
+   * cannot reach out. That matters more here than anywhere else in the toolbar:
+   * this panel is open on top of the very application being recorded.
    */
 
   const CSS = `
     :host { all: initial; }
-    * { box-sizing: border-box; font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    * { box-sizing: border-box; font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+         -webkit-font-smoothing: antialiased; }
     .layer { position: fixed; inset: 0; z-index: 2147483646; pointer-events: none; }
     .layer > * { pointer-events: auto; }
     button { font: inherit; border: 0; background: none; color: inherit; cursor: pointer; display: inline-flex;
-      align-items: center; gap: 6px; border-radius: 999px; }
-    .scrim { position: fixed; inset: 0; background: rgba(6,7,10,.62); backdrop-filter: blur(3px); }
-    .sheet { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 420px; max-width: 92vw;
-      background: #0e0f13; color: #e7e8ea; border: 1px solid #2a2c33; border-radius: 18px; padding: 18px;
-      box-shadow: 0 24px 70px rgba(0,0,0,.55); }
-    .sheet h2 { margin: 0 0 2px; font-size: 15px; font-weight: 700; }
-    .sheet p.sub { margin: 0 0 14px; font-size: 12px; color: #9a9da6; line-height: 1.45; }
-    .seg { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; background: #16181e; padding: 4px;
-      border-radius: 12px; margin-bottom: 12px; }
-    .seg button { justify-content: center; padding: 9px 6px; border-radius: 9px; font-size: 12.5px; font-weight: 600;
-      color: #b6b8bf; flex-direction: column; gap: 3px; }
+      align-items: center; justify-content: center; gap: 6px; border-radius: 8px; }
+    button:disabled { opacity: .45; cursor: default; }
+    .scrim { position: fixed; inset: 0; background: rgba(6,7,10,.66); backdrop-filter: blur(4px); }
+
+    /* ── sheets ── */
+    .sheet { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 430px; max-width: 92vw;
+      max-height: 88vh; overflow-y: auto; background: #0e0f13; color: #e7e8ea; border: 1px solid #24262d;
+      border-radius: 16px; padding: 16px; box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+    .sheet h2 { margin: 0 0 2px; font-size: 14.5px; font-weight: 700; letter-spacing: -0.01em; }
+    .sheet p.sub { margin: 0 0 13px; font-size: 12px; color: #92959e; line-height: 1.45; }
+    .seg { display: grid; grid-template-columns: repeat(3,1fr); gap: 4px; background: #15171c; padding: 3px;
+      border-radius: 10px; margin-bottom: 11px; }
+    .seg button { flex-direction: column; gap: 2px; padding: 8px 4px; border-radius: 8px; font-size: 12px;
+      font-weight: 600; color: #b0b3bb; }
     .seg button.on { background: #f59e0b; color: #16130a; }
-    .seg button small { font-size: 9.5px; font-weight: 600; opacity: .8; }
-    .row { display: flex; align-items: center; justify-content: space-between; padding: 9px 2px; font-size: 13px;
-      border-top: 1px solid #1c1e24; }
+    .seg button small { font-size: 9.5px; font-weight: 600; opacity: .82; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 2px;
+      font-size: 12.5px; border-top: 1px solid #1a1c22; }
     .row:first-of-type { border-top: 0; }
-    .row .lbl small { display: block; font-size: 11px; color: #82858e; margin-top: 1px; }
-    .sw { width: 40px; height: 23px; border-radius: 999px; background: #2a2c33; position: relative; flex: none; transition: background .15s; }
-    .sw i { position: absolute; top: 3px; left: 3px; width: 17px; height: 17px; border-radius: 999px; background: #fff;
+    .row .lbl small { display: block; font-size: 10.5px; color: #7e818a; margin-top: 1px; font-weight: 500; }
+    .sw { width: 36px; height: 21px; border-radius: 999px; background: #2a2c33; position: relative; flex: none;
+      transition: background .15s; cursor: pointer; }
+    .sw i { position: absolute; top: 3px; left: 3px; width: 15px; height: 15px; border-radius: 999px; background: #fff;
       transition: transform .15s; }
     .sw.on { background: #f59e0b; }
-    .sw.on i { transform: translateX(17px); }
-    .sw.off { opacity: .45; }
-    .cta { width: 100%; justify-content: center; margin-top: 14px; padding: 11px; background: #f59e0b; color: #16130a;
-      font-weight: 800; font-size: 13.5px; border-radius: 12px; }
-    .cta.ghost { background: #1c1e24; color: #d8dae0; font-weight: 600; margin-top: 8px; }
-    .cta[disabled] { opacity: .5; cursor: default; }
-    .note { margin-top: 10px; font-size: 11.5px; line-height: 1.5; color: #9a9da6; background: #14161b;
-      border: 1px solid #22242b; border-radius: 10px; padding: 9px 11px; }
-    .note b { color: #d8dae0; font-weight: 700; }
+    .sw.on i { transform: translateX(15px); }
+    .pick { flex: none; background: #15171c; border: 1px solid #24262d; color: #d5d7dd; font-size: 11.5px;
+      font-weight: 600; border-radius: 7px; padding: 5px 7px; max-width: 190px; }
+    .cta { width: 100%; padding: 10px; background: #f59e0b; color: #16130a; font-weight: 800; font-size: 13px;
+      border-radius: 10px; margin-top: 12px; }
+    .cta.ghost { background: #191b21; color: #cdd0d6; font-weight: 600; margin-top: 7px; }
+    .note { margin-top: 9px; font-size: 11.5px; line-height: 1.5; color: #92959e; background: #131519;
+      border: 1px solid #202229; border-radius: 9px; padding: 8px 10px; }
+    .note b { color: #d5d7dd; font-weight: 700; }
+    .note.err { border-color: #4a2020; color: #f0a0a0; }
 
-    .count { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(6,7,10,.5); }
-    .count span { font-size: 128px; font-weight: 800; color: #fff; text-shadow: 0 8px 40px rgba(0,0,0,.6); }
+    /* ── library ── */
+    .lib { margin-top: 12px; border-top: 1px solid #1a1c22; padding-top: 10px; }
+    .lib h3 { margin: 0 0 7px; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: #7a7d86; }
+    .libitem { display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 8px; border-radius: 9px;
+      text-align: left; font-size: 12px; color: #d5d7dd; }
+    .libitem:hover { background: #17191f; }
+    .libitem .thumb { width: 46px; height: 30px; border-radius: 5px; background: #000 center/cover; flex: none;
+      border: 1px solid #24262d; }
+    .libitem .grow { flex: 1; min-width: 0; }
+    .libitem .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .libitem .mt { font-size: 10.5px; color: #7a7d86; margin-top: 1px; }
+    .libitem .del { flex: none; width: 24px; height: 24px; color: #6d707a; border-radius: 6px; }
+    .libitem .del:hover { background: #2a1414; color: #f87171; }
 
+    .count { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(6,7,10,.55); }
+    .count span { font-size: 120px; font-weight: 800; color: #fff; text-shadow: 0 8px 40px rgba(0,0,0,.6); }
+
+    /* ── recording HUD ── */
     .hud { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; align-items: center;
-      gap: 4px; background: #0e0f13; border: 1px solid #2a2c33; border-radius: 999px; padding: 5px;
-      box-shadow: 0 8px 30px rgba(0,0,0,.45); color: #e7e8ea; }
-    .hud .rec { display: inline-flex; align-items: center; gap: 7px; padding: 0 12px 0 11px; height: 32px;
-      font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
-    .hud .dot { width: 9px; height: 9px; border-radius: 999px; background: #ef4444; animation: ps-blink 1.3s infinite; }
-    .hud.paused .dot { animation: none; background: #9a9da6; }
+      gap: 3px; background: #0e0f13; border: 1px solid #2a2c33; border-radius: 999px; padding: 4px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.45); color: #e7e8ea;
+      transition: transform .34s cubic-bezier(.4,0,.2,1), opacity .26s ease; }
+    .hud.tuck { transform: translateX(-50%) translateY(calc(100% + 24px)); opacity: 0; }
+    .hud .rec { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; height: 29px;
+      font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .hud .dot { width: 8px; height: 8px; border-radius: 999px; background: #ef4444; animation: ps-blink 1.3s infinite; }
+    .hud.paused .dot { animation: none; background: #92959e; }
     @keyframes ps-blink { 50% { opacity: .25; } }
-    .hud button { height: 32px; padding: 0 12px; font-size: 12.5px; font-weight: 600; color: #b6b8bf; }
+    .hud button { height: 29px; padding: 0 10px; font-size: 12px; font-weight: 600; color: #b0b3bb; border-radius: 999px; }
     .hud button:hover { background: #1c1e24; color: #fff; }
     .hud button.stop { background: #ef4444; color: #fff; font-weight: 700; }
-    .hud .meta { font-size: 10.5px; color: #82858e; padding: 0 8px; font-variant-numeric: tabular-nums; }
-    /* When the capture IS this tab, the HUD is part of the picture. It cannot
-       be excluded from the frame, so it removes itself instead: away after a
-       few seconds, back when the pointer comes looking for it. */
-    .hud { transition: transform .34s cubic-bezier(.4,0,.2,1), opacity .26s ease; }
-    .hud.tuck { transform: translateX(-50%) translateY(calc(100% + 24px)); opacity: 0; }
-    .hud .tip { font-size: 10.5px; color: #6f727a; padding: 0 8px 0 2px; }
+    .hud .meta { font-size: 10px; color: #7a7d86; padding: 0 6px; font-variant-numeric: tabular-nums; }
+    .hud .tip { font-size: 10px; color: #63666e; padding: 0 7px 0 1px; }
 
-    .studio { position: fixed; inset: 3vh 3vw; background: #0b0c0f; border: 1px solid #24262d; border-radius: 18px;
-      display: grid; grid-template-columns: 1fr 268px; grid-template-rows: 46px 1fr 132px; overflow: hidden;
-      box-shadow: 0 30px 90px rgba(0,0,0,.6); color: #e7e8ea; }
-    .studio .top { grid-column: 1/-1; display: flex; align-items: center; gap: 10px; padding: 0 12px;
-      border-bottom: 1px solid #1c1e24; font-size: 13px; font-weight: 700; }
-    .studio .top .grow { flex: 1; }
-    .studio .top button { height: 30px; padding: 0 13px; font-size: 12.5px; font-weight: 700; background: #1c1e24; color: #d8dae0; }
-    .studio .top button.primary { background: #f59e0b; color: #16130a; }
-    .studio .top button[disabled] { opacity: .5; cursor: default; }
-    .stage { background: #08090b; display: grid; place-items: center; overflow: hidden; position: relative; }
-    .stage canvas { max-width: 100%; max-height: 100%; border-radius: 6px; }
-    .side { border-left: 1px solid #1c1e24; overflow-y: auto; padding: 12px; }
-    .side h3 { margin: 14px 0 7px; font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: #7e818a; }
-    .side h3:first-child { margin-top: 0; }
-    .ctl { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; padding: 5px 0; }
-    .ctl input[type=range] { flex: 1; accent-color: #f59e0b; height: 3px; }
-    .ctl .v { font-size: 10.5px; color: #8b8e97; width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
-    .swatches { display: grid; grid-template-columns: repeat(4,1fr); gap: 6px; }
-    .swatches button { height: 30px; border-radius: 8px; border: 2px solid transparent; }
+    /* ── studio, full screen ── */
+    .studio { position: fixed; inset: 0; background: #0a0b0e; display: grid;
+      grid-template-columns: minmax(0,1fr) 246px; grid-template-rows: 42px minmax(0,1fr) auto 3px;
+      color: #e7e8ea; }
+    .top { grid-column: 1/-1; display: flex; align-items: center; gap: 9px; padding: 0 11px;
+      border-bottom: 1px solid #191b21; font-size: 12.5px; }
+    .top .mark { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; letter-spacing: -0.01em; }
+    .top .nm { background: none; border: 0; color: #e7e8ea; font-size: 12.5px; font-weight: 600; padding: 3px 6px;
+      border-radius: 6px; min-width: 60px; max-width: 260px; }
+    .top .nm:hover, .top .nm:focus { background: #17191f; outline: none; }
+    .top .stat { font-size: 11px; color: #7a7d86; font-variant-numeric: tabular-nums; }
+    .top .grow { flex: 1; }
+    .top button.act { height: 27px; padding: 0 11px; font-size: 12px; font-weight: 700; background: #191b21;
+      color: #cdd0d6; border-radius: 7px; }
+    .top button.act:hover { background: #21242b; }
+    .top button.act.primary { background: #f59e0b; color: #16130a; }
+    .top button.act.primary:hover { background: #fbb02b; }
+
+    .stage { position: relative; display: grid; place-items: center; overflow: hidden; padding: 14px;
+      background: radial-gradient(ellipse at 50% 0%, #111319 0%, #08090b 70%); }
+    .stage canvas { max-width: 100%; max-height: 100%; border-radius: 4px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+    .stage .badge { position: absolute; top: 10px; left: 12px; font-size: 10px; font-weight: 700; letter-spacing: .06em;
+      text-transform: uppercase; color: #6d707a; background: #101218; border: 1px solid #1e2027; padding: 3px 7px;
+      border-radius: 999px; }
+
+    /* ── inspector ── */
+    .side { border-left: 1px solid #191b21; display: flex; flex-direction: column; min-height: 0; }
+    .tabs { display: flex; padding: 6px; gap: 2px; border-bottom: 1px solid #191b21; }
+    .tabs button { flex: 1; height: 25px; font-size: 11px; font-weight: 600; color: #85888f; border-radius: 6px; }
+    .tabs button.on { background: #1c1f26; color: #fff; }
+    .pane { flex: 1; overflow-y: auto; padding: 9px 11px 14px; }
+    .pane h4 { margin: 12px 0 6px; font-size: 9.5px; letter-spacing: .09em; text-transform: uppercase; color: #6d707a; }
+    .pane h4:first-child { margin-top: 2px; }
+    .ctl { display: flex; align-items: center; gap: 8px; font-size: 11.5px; padding: 3px 0; color: #b8bbc2; }
+    .ctl > span:first-child { width: 66px; flex: none; }
+    .ctl input[type=range] { flex: 1; accent-color: #f59e0b; height: 2px; min-width: 0; }
+    .ctl .v { font-size: 10px; color: #7a7d86; width: 38px; text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+    .ctl.tog { justify-content: space-between; }
+    .swatches { display: grid; grid-template-columns: repeat(4,1fr); gap: 5px; }
+    .swatches button { height: 26px; border-radius: 6px; border: 2px solid transparent; }
     .swatches button.on { border-color: #f59e0b; }
-    .transport { grid-column: 1/-1; border-top: 1px solid #1c1e24; padding: 8px 12px; display: flex;
-      flex-direction: column; gap: 7px; }
-    .transport .bar { display: flex; align-items: center; gap: 10px; font-size: 12px; }
-    .transport .bar button { width: 32px; height: 32px; justify-content: center; background: #1c1e24; }
-    .time { font-variant-numeric: tabular-nums; font-size: 11.5px; color: #9a9da6; }
-    .track { position: relative; height: 46px; background: #101216; border: 1px solid #1e2027; border-radius: 8px;
-      overflow: hidden; cursor: pointer; }
-    .track .seg-block { position: absolute; top: 6px; bottom: 6px; background: linear-gradient(180deg,#a855f7,#7c3aed);
-      border-radius: 6px; opacity: .9; display: flex; align-items: center; padding: 0 6px; font-size: 10px;
-      font-weight: 700; color: #fff; overflow: hidden; }
-    .track .seg-block .x { margin-left: auto; opacity: .75; font-size: 12px; }
-    .track .clickmark { position: absolute; bottom: 2px; width: 2px; height: 8px; background: #38bdf8; border-radius: 2px; }
-    .track .play { position: absolute; top: 0; bottom: 0; width: 2px; background: #f59e0b; pointer-events: none; }
-    .progress { grid-column: 1/-1; height: 3px; background: #1c1e24; }
+    .hint { font-size: 10.5px; color: #6d707a; line-height: 1.45; margin-top: 8px; }
+
+    /* ── transport + timeline ── */
+    .bottom { grid-column: 1/-1; border-top: 1px solid #191b21; padding: 7px 11px 9px;
+      display: flex; flex-direction: column; gap: 6px; }
+    .tbar { display: flex; align-items: center; gap: 9px; font-size: 11.5px; color: #b8bbc2; }
+    .tbar button.ic { width: 28px; height: 28px; background: #191b21; border-radius: 7px; color: #d5d7dd; }
+    .tbar button.ic:hover { background: #21242b; }
+    .tbar button.tool { height: 26px; padding: 0 9px; font-size: 11px; font-weight: 600; background: #191b21;
+      color: #b8bbc2; border-radius: 7px; }
+    .tbar button.tool:hover { background: #21242b; color: #fff; }
+    .tbar .time { font-variant-numeric: tabular-nums; font-size: 11px; color: #85888f; }
+    .track { position: relative; height: 52px; background: #0e1014; border: 1px solid #1c1e25; border-radius: 7px;
+      overflow: hidden; cursor: text; user-select: none; }
+    .track .zoomrow { position: absolute; left: 0; right: 0; top: 5px; height: 26px; }
+    .track .seg-block { position: absolute; top: 0; height: 26px; background: linear-gradient(180deg,#a855f7,#7c3aed);
+      border-radius: 5px; display: flex; align-items: center; padding: 0 5px; font-size: 9.5px; font-weight: 700;
+      color: #fff; overflow: hidden; cursor: grab; box-shadow: 0 2px 8px rgba(124,58,237,.4); }
+    .track .seg-block.sel { outline: 1.5px solid #fbbf24; outline-offset: -1.5px; }
+    .track .seg-block .x { margin-left: auto; opacity: .8; font-size: 12px; padding: 0 1px; }
+    .track .clickmark { position: absolute; bottom: 4px; width: 2px; height: 9px; background: #38bdf8; border-radius: 2px; }
+    .track .keymark { position: absolute; bottom: 4px; width: 2px; height: 5px; background: #475569; border-radius: 2px; }
+    .track .play { position: absolute; top: 0; bottom: 0; width: 1.5px; background: #fbbf24; pointer-events: none;
+      box-shadow: 0 0 8px rgba(251,191,36,.7); }
+    .track .trim { position: absolute; top: 0; bottom: 0; background: rgba(8,9,11,.78); pointer-events: none; }
+    .track .handle { position: absolute; top: 0; bottom: 0; width: 9px; background: #fbbf24; cursor: ew-resize;
+      display: flex; align-items: center; justify-content: center; }
+    .track .handle::after { content: ""; width: 1px; height: 14px; background: rgba(0,0,0,.5); }
+    .progress { grid-column: 1/-1; background: #191b21; }
     .progress i { display: block; height: 100%; background: #f59e0b; width: 0; transition: width .2s; }
-    .empty { color: #7e818a; font-size: 12px; text-align: center; padding: 20px; }
+    .empty { color: #6d707a; font-size: 11.5px; text-align: center; padding: 16px; }
   `;
 
   const h = (tag, attrs, kids) => {
     const n = document.createElement(tag);
-    if (attrs) for (const k in attrs) {
-      if (k === "class") n.className = attrs[k];
-      else if (k === "html") n.innerHTML = attrs[k];
-      else if (k.startsWith("on")) n.addEventListener(k.slice(2), attrs[k]);
-      else n.setAttribute(k, attrs[k]);
-    }
-    (kids || []).forEach((c) => n.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
+    if (attrs)
+      for (const k in attrs) {
+        if (k === "class") n.className = attrs[k];
+        else if (k === "html") n.innerHTML = attrs[k];
+        else if (k.startsWith("on")) n.addEventListener(k.slice(2), attrs[k]);
+        else if (attrs[k] != null) n.setAttribute(k, attrs[k]);
+      }
+    (kids || []).forEach((c) => c != null && n.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
     return n;
   };
 
@@ -2136,28 +2395,37 @@
     const host = document.createElement("div");
     host.setAttribute("data-pinstage-studio", "");
     const root = host.attachShadow({ mode: "open" });
-    const style = document.createElement("style");
-    style.textContent = CSS;
-    root.appendChild(style);
+    root.appendChild(h("style", { html: CSS }));
     const layer = h("div", { class: "layer" });
     root.appendChild(layer);
     document.body.appendChild(host);
     return { host, layer, destroy: () => host.remove() };
   }
 
-  const toggleRow = (label, hint, initial, onChange, disabled) => {
-    const sw = h("div", { class: "sw" + (initial ? " on" : "") + (disabled ? " off" : "") }, [h("i")]);
+  const toggleRow = (label, hint, initial, onChange) => {
+    const sw = h("div", { class: "sw" + (initial ? " on" : "") }, [h("i")]);
+    let on = initial;
     const row = h("div", { class: "row" }, [
       h("div", { class: "lbl", html: label + (hint ? "<small>" + hint + "</small>" : "") }),
       sw,
     ]);
+    row.addEventListener("click", () => {
+      on = !on;
+      sw.classList.toggle("on", on);
+      onChange(on);
+    });
+    return row;
+  };
+
+  const toggleCtl = (label, initial, onChange) => {
+    const sw = h("div", { class: "sw" + (initial ? " on" : "") }, [h("i")]);
     let on = initial;
-    if (!disabled)
-      row.addEventListener("click", () => {
-        on = !on;
-        sw.classList.toggle("on", on);
-        onChange(on);
-      });
+    const row = h("div", { class: "ctl tog" }, [h("span", {}, [label]), sw]);
+    row.addEventListener("click", () => {
+      on = !on;
+      sw.classList.toggle("on", on);
+      onChange(on);
+    });
     return row;
   };
 
@@ -2174,12 +2442,6 @@
 
   /* ── the flow ──────────────────────────────────────────────────────────── */
 
-  /**
-   * @param {object} opts
-   *   onAttach  — when present, the editor's primary action hands the finished
-   *               file back instead of downloading it. This is what turns the
-   *               tutorial recorder into "attach a video to this issue".
-   */
   function open(opts) {
     const o = opts || {};
     const ui = mount();
@@ -2192,12 +2454,17 @@
       ui.destroy();
     };
 
-    /* ── 1. what to record ── */
-    function preflight() {
+    const sheet = (kids) => {
       ui.layer.innerHTML = "";
-      const cfg = { source: "tab", mic: true, camera: false, systemAudio: false };
-      const scrim = h("div", { class: "scrim", onclick: teardown });
-      const sheet = h("div", { class: "sheet" });
+      ui.layer.appendChild(h("div", { class: "scrim", onclick: teardown }));
+      const el = h("div", { class: "sheet" }, kids);
+      ui.layer.appendChild(el);
+      return el;
+    };
+
+    /* ── 1. what to record, and what has been recorded before ── */
+    async function preflight() {
+      const cfg = { source: "tab", mic: true, camera: false, cameraDeviceId: null, systemAudio: false };
 
       const sources = [
         ["tab", "This tab", "full effects"],
@@ -2211,37 +2478,77 @@
         note.innerHTML =
           cfg.source === "tab"
             ? "Recording this tab captures the pointer as data, so Studio can draw a <b>smooth cursor with motion blur</b> and <b>zoom in on every click</b> automatically."
-            : "A browser can only read the pointer inside its own page, so a window or screen recording gets the <b>operating system cursor baked in and no automatic zoom</b>. You can still add zooms by hand on the timeline.";
+            : "A browser can only read the pointer inside its own page, so a window or screen recording gets the <b>operating system cursor baked in and no automatic zoom</b>. You can still place zooms by hand on the timeline.";
       };
-      sources.forEach(([key, label, hint]) => {
+      sources.forEach(([key, label, hint]) =>
         seg.appendChild(
           h("button", { onclick: () => { cfg.source = key; paint(); } }, [
             h("span", {}, [label]),
             h("small", {}, [hint]),
           ])
-        );
-      });
+        )
+      );
       paint();
 
-      sheet.appendChild(h("h2", {}, ["Record"]));
-      sheet.appendChild(h("p", { class: "sub" }, ["Screen, voice and webcam. Clicks become zooms."]));
-      sheet.appendChild(seg);
-      sheet.appendChild(toggleRow("Microphone", "your narration", cfg.mic, (v) => (cfg.mic = v)));
-      sheet.appendChild(toggleRow("Webcam", "recorded separately, movable later", cfg.camera, (v) => (cfg.camera = v)));
-      sheet.appendChild(toggleRow("System audio", "sound from the page itself", cfg.systemAudio, (v) => (cfg.systemAudio = v)));
-      sheet.appendChild(note);
+      // Camera picker — populated lazily, because enumerating devices asks for
+      // permission and nobody should be prompted for a camera they did not ask
+      // to use.
+      const camSelect = h("select", { class: "pick" }, [h("option", { value: "" }, ["Default camera"])]);
+      camSelect.style.display = "none";
+      camSelect.addEventListener("change", () => (cfg.cameraDeviceId = camSelect.value || null));
 
-      if (!store.supported) {
-        sheet.appendChild(
-          h("div", { class: "note", html: "<b>Heads up:</b> this browser has no origin private file system, so the recording is held in memory. Keep it short — a long one will exhaust the tab." })
-        );
-      }
+      let stopWatchingCameras = null;
+      const fillCameras = async () => {
+        const cams = await listCameras().catch(() => []);
+        const keep = camSelect.value;
+        camSelect.innerHTML = "";
+        if (!cams.length) {
+          camSelect.appendChild(h("option", { value: "" }, ["No camera found"]));
+          return;
+        }
+        cams.forEach((c) => {
+          const tag = CAMERA_KIND_LABEL[c.kind];
+          camSelect.appendChild(h("option", { value: c.id }, [`${c.label}${tag ? " · " + tag : ""}`]));
+        });
+        // An iPhone that just woke up is almost always the one they meant.
+        const iphone = cams.find((c) => c.kind === "continuity");
+        camSelect.value = cams.some((c) => c.id === keep) ? keep : (iphone || cams[0]).id;
+        cfg.cameraDeviceId = camSelect.value;
+      };
+
+      const camRow = toggleRow("Webcam", "recorded separately, movable later", cfg.camera, async (v) => {
+        cfg.camera = v;
+        camSelect.style.display = v ? "" : "none";
+        if (v) {
+          await fillCameras();
+          // A phone appearing or disappearing mid-setup should show up here.
+          if (!stopWatchingCameras) stopWatchingCameras = onCameraChange(fillCameras);
+        }
+      });
+      camRow.insertBefore(camSelect, camRow.lastChild);
 
       const go = h("button", { class: "cta" }, ["Choose what to share →"]);
+      const body = [
+        h("h2", {}, ["Record"]),
+        h("p", { class: "sub" }, ["Screen, voice and webcam. Clicks become zooms."]),
+        seg,
+        toggleRow("Microphone", "your narration", cfg.mic, (v) => (cfg.mic = v)),
+        camRow,
+        toggleRow("System audio", "sound from the page itself", cfg.systemAudio, (v) => (cfg.systemAudio = v)),
+        note,
+      ];
+      if (!store.supported)
+        body.push(h("div", { class: "note", html: "<b>Heads up:</b> this browser has no origin private file system, so the recording is held in memory and cannot be reopened later. Keep it short." }));
+      body.push(go);
+      body.push(h("button", { class: "cta ghost", onclick: teardown }, ["Cancel"]));
+
+      const el = sheet(body);
+
       go.addEventListener("click", async () => {
         go.disabled = true;
         go.textContent = "Waiting for the picker…";
         try {
+          if (stopWatchingCameras) stopWatchingCameras();
           await countdownThenRecord(cfg);
         } catch (e) {
           go.disabled = false;
@@ -2249,25 +2556,56 @@
           const msg = /denied|not allowed|Permission/i.test(String(e && e.message))
             ? "Screen sharing was declined."
             : String((e && e.message) || e);
-          let n = sheet.querySelector(".note.err");
-          if (!n) { n = h("div", { class: "note err" }); sheet.appendChild(n); }
+          let n = el.querySelector(".note.err");
+          if (!n) { n = h("div", { class: "note err" }); el.insertBefore(n, go); }
           n.innerHTML = "<b>Could not start:</b> " + msg;
         }
       });
-      sheet.appendChild(go);
-      sheet.appendChild(h("button", { class: "cta ghost", onclick: teardown }, ["Cancel"]));
 
-      ui.layer.appendChild(scrim);
-      ui.layer.appendChild(sheet);
+      // Past recordings, appended once the disk has been read.
+      const saved = await listRecordings().catch(() => []);
+      if (saved.length) {
+        const lib = h("div", { class: "lib" }, [h("h3", {}, [saved.length + " saved on this device"])]);
+        saved.slice(0, 6).forEach((r) => {
+          const when = formatDuration(r.meta.durationMs || 0);
+          const name = (r.project && r.project.name) || "Recording";
+          const item = h("button", { class: "libitem" }, [
+            h("div", { class: "thumb", style: r.project && r.project.poster ? `background-image:url(${r.project.poster})` : "" }),
+            h("div", { class: "grow" }, [
+              h("div", { class: "nm" }, [name]),
+              h("div", { class: "mt" }, [
+                when + " · " + formatBytes(r.meta.bytes || 0) +
+                (r.project && r.project.exports && r.project.exports.length ? " · saved" : ""),
+              ]),
+            ]),
+            h("span", { class: "del", title: "Delete this recording", html: "&times;" }),
+          ]);
+          item.addEventListener("click", async (e) => {
+            if (e.target.classList.contains("del")) {
+              e.stopPropagation();
+              await store.remove(r.id).catch(() => {});
+              preflight();
+              return;
+            }
+            try {
+              const rec = await openRecording(r.id);
+              editor(rec, migrateProject(r.project, rec));
+            } catch (err) {
+              alert(String((err && err.message) || err));
+            }
+          });
+          lib.appendChild(item);
+        });
+        el.insertBefore(lib, el.querySelector(".cta"));
+      }
     }
 
     /* ── 2. countdown, then the HUD ── */
     async function countdownThenRecord(cfg) {
       // The picker must open straight from the click or the browser rejects it
       // as an untrusted gesture — so the capture is acquired first and the
-      // countdown runs in the gap before recording actually starts. Doing it
-      // the other way round puts the picker's fade-out and a giant "3 2 1" at
-      // the head of every recording.
+      // countdown runs in the gap before recording actually starts. The other
+      // way round puts the picker's fade-out and a giant "3 2 1" on the tape.
       session = await startSession(cfg, {
         onSurfaceEnded: () => finish(),
         beforeRecord: async () => {
@@ -2278,7 +2616,7 @@
           ui.layer.appendChild(count);
           for (const v of ["3", "2", "1"]) {
             n.textContent = v;
-            await new Promise((r) => setTimeout(r, 620));
+            await new Promise((r) => setTimeout(r, 600));
           }
           count.remove();
         },
@@ -2290,7 +2628,6 @@
       ui.layer.innerHTML = "";
       const bar = h("div", { class: "hud" });
       const time = h("span", {}, ["0:00"]);
-      const rec = h("div", { class: "rec" }, [h("span", { class: "dot" }), time]);
       const meta = h("span", { class: "meta" }, [""]);
       const pause = h("button", {}, ["Pause"]);
       const mark = h("button", { title: "Mark this moment for a zoom" }, ["Zoom here"]);
@@ -2303,11 +2640,11 @@
       mark.addEventListener("click", () => {
         const n = session.mark();
         mark.textContent = "Marked ×" + n;
-        setTimeout(() => (mark.textContent = "Zoom here"), 1200);
+        setTimeout(() => (mark.textContent = "Zoom here"), 1100);
       });
       stop.addEventListener("click", finish);
 
-      bar.appendChild(rec);
+      bar.appendChild(h("div", { class: "rec" }, [h("span", { class: "dot" }), time]));
       bar.appendChild(meta);
       bar.appendChild(pause);
       if (session.capture.canDrawCursor) bar.appendChild(mark);
@@ -2323,7 +2660,7 @@
 
       // Only hide when it would otherwise be filmed. On a window or screen
       // recording the HUD is on a surface that is not being captured, so
-      // hiding it would just be annoying.
+      // hiding it would just be irritating.
       if (session.capture.isThisTab) {
         bar.appendChild(h("span", { class: "tip" }, ["hides itself · move to the bottom edge"]));
         let hideTimer = 0;
@@ -2334,245 +2671,358 @@
           hideTimer = setTimeout(tuck, 2600);
         };
         peek();
-        const onMove = (e) => {
-          if (e.clientY > innerHeight - 90) peek();
-        };
+        const onMove = (e) => { if (e.clientY > innerHeight - 90) peek(); };
         addEventListener("pointermove", onMove, { passive: true });
-        const stopWatching = setInterval(() => {
+        const watch = setInterval(() => {
           if (!closed && session) return;
-          clearInterval(stopWatching);
+          clearInterval(watch);
           clearTimeout(hideTimer);
           removeEventListener("pointermove", onMove);
         }, 500);
       }
     }
 
-    /* ── 3. stop and edit ── */
+    /* ── 3. stop, then edit ── */
     async function finish() {
       if (!session) return teardown();
       const s = session;
       session = null;
-      ui.layer.innerHTML = "";
-      ui.layer.appendChild(h("div", { class: "scrim" }));
-      ui.layer.appendChild(h("div", { class: "sheet" }, [h("h2", {}, ["Finishing the recording…"]), h("p", { class: "sub" }, ["Flushing the last chunks to disk."])]));
+      sheet([h("h2", {}, ["Finishing the recording…"]), h("p", { class: "sub" }, ["Flushing the last chunks to disk."])]);
       const result = await s.stop();
       if (result.meta.durationMs < 700) {
-        ui.layer.innerHTML = "";
-        ui.layer.appendChild(h("div", { class: "scrim", onclick: teardown }));
-        ui.layer.appendChild(
-          h("div", { class: "sheet" }, [
-            h("h2", {}, ["That was too short"]),
-            h("p", { class: "sub" }, ["Nothing was saved. Try again and give it a couple of seconds."]),
-            h("button", { class: "cta", onclick: teardown }, ["Close"]),
-          ])
-        );
         await store.remove(result.meta.id).catch(() => {});
+        sheet([
+          h("h2", {}, ["That was too short"]),
+          h("p", { class: "sub" }, ["Nothing was kept. Try again and give it a couple of seconds."]),
+          h("button", { class: "cta", onclick: teardown }, ["Close"]),
+        ]);
         return;
       }
-      editor(result);
+      const project = newProject(result);
+      project.edit.style.camera.show = result.meta.hasCamera;
+      project.edit.style.cursor.show = result.meta.hasCursorTrack;
+      project.edit.segments = result.meta.hasCursorTrack ? planZooms(result.track, result.meta.durationMs) : [];
+      (result.track.markers || []).forEach((m) =>
+        project.edit.segments.push({
+          id: uuid(), start: Math.max(0, m.t - 400), end: Math.min(result.meta.durationMs, m.t + 2600),
+          inMs: 800, outMs: 700, scale: 1.8, x: 0.5, y: 0.5, auto: false, clicks: 1,
+        })
+      );
+      project.edit.segments.sort((a, b) => a.start - b.start);
+      await saveProject(project);
+      editor(result, project);
     }
 
-    function editor(rec) {
+    /* ── 4. the editor ── */
+    function editor(rec, project) {
       ui.layer.innerHTML = "";
-      const style = JSON.parse(JSON.stringify(STYLE_DEFAULTS));
-      style.camera.show = rec.meta.hasCamera;
-      style.cursor.show = rec.meta.hasCursorTrack;
+      const edit = project.edit;
+      const style = edit.style;
+      let keys = buildCameraTrack(edit.segments);
+      let selected = null;
 
-      let segments = rec.meta.hasCursorTrack
-        ? planZooms(rec.track, rec.meta.durationMs)
-        : [];
-      // A manual "zoom here" during recording is a click the planner never saw.
-      (rec.track.markers || []).forEach((m) => {
-        segments.push({
-          id: uuid(), start: Math.max(0, m.t - 400), end: Math.min(rec.meta.durationMs, m.t + 2600),
-          inMs: 800, outMs: 700, scale: 1.8, x: 0.5, y: 0.5, auto: false, clicks: 1,
-        });
-      });
-      segments.sort((a, b) => a.start - b.start);
-      let keys = buildCameraTrack(segments);
+      // Autosave. Every drag, toggle and rename lands on disk a beat later, so
+      // closing the tab is never a way to lose work.
+      let saveTimer = 0;
+      const touch = () => {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => saveProject(project).catch(() => {}), 400);
+      };
+      const recompute = () => {
+        keys = buildCameraTrack(edit.segments);
+        paintTrack();
+        touch();
+      };
 
       const wrap = h("div", { class: "studio" });
       const stage = h("div", { class: "stage" });
       const canvas = h("canvas");
-      // The capture's reported settings and the picture the encoder actually
-      // produced can disagree — getSettings() is read the instant the stream
-      // arrives, before a single frame exists, and a tab that is resized mid
-      // recording moves it again. Trusting it stretches the preview: circles
-      // come out as ellipses. So these are provisional, and the decoded video
-      // overrides them the moment it can.
+      // Provisional until the decoded video says otherwise — getSettings() is
+      // read before a frame exists and is routinely wrong about the shape.
       let srcW = rec.meta.width, srcH = rec.meta.height;
       const outW = 1600;
       let outH = Math.round((outW * srcH) / Math.max(1, srcW) / 2) * 2;
       canvas.width = outW; canvas.height = outH;
       const ctx = canvas.getContext("2d", { alpha: false });
       stage.appendChild(canvas);
+      stage.appendChild(h("div", { class: "badge" }, [rec.meta.hasCursorTrack ? "cursor tracked" : "no pointer data"]));
 
       const video = document.createElement("video");
       video.muted = true; video.playsInline = true; video.preload = "auto";
-      video.addEventListener(
-        "loadedmetadata",
-        () => {
-          if (!video.videoWidth || !video.videoHeight) return;
-          srcW = video.videoWidth;
-          srcH = video.videoHeight;
-          outH = Math.round((outW * srcH) / srcW / 2) * 2;
-          canvas.width = outW;
-          canvas.height = outH;
-          // Correct the record too, so the export renders the same shape the
-          // preview just showed.
-          rec.meta.width = srcW;
-          rec.meta.height = srcH;
-        },
-        { once: true }
-      );
+      video.addEventListener("loadedmetadata", () => {
+        if (!video.videoWidth) return;
+        srcW = video.videoWidth; srcH = video.videoHeight;
+        outH = Math.round((outW * srcH) / srcW / 2) * 2;
+        canvas.width = outW; canvas.height = outH;
+        rec.meta.width = srcW; rec.meta.height = srcH;
+      }, { once: true });
       video.src = URL.createObjectURL(rec.files.screen);
       const camVideo = rec.files.camera ? document.createElement("video") : null;
       if (camVideo) { camVideo.muted = true; camVideo.playsInline = true; camVideo.src = URL.createObjectURL(rec.files.camera); }
 
-      const side = h("div", { class: "side" });
-      const transport = h("div", { class: "transport" });
-      const progress = h("div", { class: "progress" }, [h("i")]);
-      const top = h("div", { class: "top" });
+      const dur = rec.meta.durationMs;
+      const pct = (ms) => (clamp(ms, 0, dur) / dur) * 100 + "%";
 
       /* preview */
       let raf = 0;
       const draw = () => {
-        const t = video.currentTime * 1000;
-        renderFrame(ctx, {
-          W: outW, H: outH, src: video, srcW, srcH,
-          t, style, keys, track: rec.track, cameraSrc: camVideo,
-        });
-        playhead.style.left = (t / rec.meta.durationMs) * 100 + "%";
-        cur.textContent = formatDuration(t);
+        let t = video.currentTime * 1000;
+        // Playback stays inside the trim, so what plays is what renders.
+        if (t > edit.trim.end) { video.pause(); video.currentTime = edit.trim.end / 1000; t = edit.trim.end; play.innerHTML = "▶"; }
+        renderFrame(ctx, { W: outW, H: outH, src: video, srcW, srcH, t, style, keys, track: rec.track, cameraSrc: camVideo });
+        playhead.style.left = pct(t);
+        cur.textContent = formatDuration(t - edit.trim.start);
         raf = requestAnimationFrame(draw);
       };
 
       /* transport */
-      const play = h("button", { html: "▶" });
+      const play = h("button", { class: "ic", html: "▶" });
       const cur = h("span", { class: "time" }, ["0:00"]);
-      const total = h("span", { class: "time" }, [formatDuration(rec.meta.durationMs)]);
+      const total = h("span", { class: "time" }, [formatDuration(edit.trim.end - edit.trim.start)]);
       const track = h("div", { class: "track" });
+      const zoomrow = h("div", { class: "zoomrow" });
       const playhead = h("div", { class: "play" });
-      play.addEventListener("click", () => {
-        if (video.paused) { video.play(); if (camVideo) { camVideo.currentTime = video.currentTime; camVideo.play(); } play.innerHTML = "❚❚"; }
-        else { video.pause(); if (camVideo) camVideo.pause(); play.innerHTML = "▶"; }
-      });
-      video.addEventListener("ended", () => (play.innerHTML = "▶"));
-      track.addEventListener("click", (e) => {
-        if (e.target.classList.contains("x")) return;
-        const r = track.getBoundingClientRect();
-        const t = ((e.clientX - r.left) / r.width) * rec.meta.durationMs;
+      const trimL = h("div", { class: "trim" });
+      const trimR = h("div", { class: "trim" });
+      const handleL = h("div", { class: "handle", title: "Trim the start" });
+      const handleR = h("div", { class: "handle", title: "Trim the end" });
+
+      const seekTo = (ms) => {
+        const t = clamp(ms, edit.trim.start, edit.trim.end);
         video.currentTime = t / 1000;
         if (camVideo) camVideo.currentTime = t / 1000;
+      };
+      play.addEventListener("click", () => {
+        if (video.paused) {
+          if (video.currentTime * 1000 >= edit.trim.end - 30) seekTo(edit.trim.start);
+          video.play(); if (camVideo) { camVideo.currentTime = video.currentTime; camVideo.play(); }
+          play.innerHTML = "❚❚";
+        } else { video.pause(); if (camVideo) camVideo.pause(); play.innerHTML = "▶"; }
+      });
+      video.addEventListener("ended", () => (play.innerHTML = "▶"));
+
+      const msAt = (clientX) => {
+        const r = track.getBoundingClientRect();
+        return ((clientX - r.left) / r.width) * dur;
+      };
+      track.addEventListener("pointerdown", (e) => {
+        if (e.target.closest(".seg-block") || e.target.classList.contains("handle")) return;
+        seekTo(msAt(e.clientX));
       });
 
-      const paintTrack = () => {
-        track.querySelectorAll(".seg-block,.clickmark").forEach((n) => n.remove());
-        (rec.track.clicks || []).filter((c) => c.kind === "down").forEach((c) => {
-          track.appendChild(h("div", { class: "clickmark", style: `left:${(c.t / rec.meta.durationMs) * 100}%` }));
-        });
-        segments.forEach((s, i) => {
-          const b = h("div", {
-            class: "seg-block",
-            style: `left:${(s.start / rec.meta.durationMs) * 100}%;width:${((s.end + s.outMs - s.start) / rec.meta.durationMs) * 100}%`,
-            title: `${s.scale.toFixed(1)}× · ${formatDuration(s.start)} → ${formatDuration(s.end)}`,
-          }, [h("span", {}, [s.scale.toFixed(1) + "×"]), h("span", { class: "x", title: "Remove this zoom" }, ["×"])]);
-          b.querySelector(".x").addEventListener("click", (e) => {
-            e.stopPropagation();
-            segments.splice(i, 1);
-            keys = buildCameraTrack(segments);
-            paintTrack();
-          });
-          track.appendChild(b);
+      // Trim handles.
+      const dragHandle = (el, which) => {
+        el.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          el.setPointerCapture(e.pointerId);
+          const move = (ev) => {
+            const v = clamp(msAt(ev.clientX), 0, dur);
+            if (which === "start") edit.trim.start = Math.min(v, edit.trim.end - 400);
+            else edit.trim.end = Math.max(v, edit.trim.start + 400);
+            total.textContent = formatDuration(edit.trim.end - edit.trim.start);
+            paintTrim();
+            touch();
+          };
+          const up = () => {
+            el.releasePointerCapture(e.pointerId);
+            removeEventListener("pointermove", move);
+            removeEventListener("pointerup", up);
+            seekTo(video.currentTime * 1000);
+          };
+          addEventListener("pointermove", move);
+          addEventListener("pointerup", up);
         });
       };
+      dragHandle(handleL, "start");
+      dragHandle(handleR, "end");
 
-      transport.appendChild(h("div", { class: "bar" }, [play, cur, h("span", { class: "time" }, ["/"]), total,
-        h("span", { style: "flex:1" }),
-        h("span", { class: "time" }, [segments.length + " zooms · " + (rec.meta.hasCursorTrack ? "cursor tracked" : "no cursor data")])]));
-      track.appendChild(playhead);
-      transport.appendChild(track);
+      const paintTrim = () => {
+        trimL.style.left = "0"; trimL.style.width = pct(edit.trim.start);
+        trimR.style.left = pct(edit.trim.end); trimR.style.right = "0";
+        handleL.style.left = `calc(${pct(edit.trim.start)} - 0px)`;
+        handleR.style.left = `calc(${pct(edit.trim.end)} - 9px)`;
+      };
 
-      /* controls */
-      side.appendChild(h("h3", {}, ["Background"]));
-      const sw = h("div", { class: "swatches" });
-      Object.keys(GRADIENTS).forEach((k) => {
-        const b = h("button", { style: `background:linear-gradient(135deg,${GRADIENTS[k].join(",")})` });
-        b.addEventListener("click", () => {
-          style.background = { kind: "gradient", value: k };
-          [...sw.children].forEach((c) => c.classList.remove("on"));
-          b.classList.add("on");
+      const paintTrack = () => {
+        zoomrow.innerHTML = "";
+        edit.segments.forEach((s, i) => {
+          const b = h("div", {
+            class: "seg-block" + (selected === s.id ? " sel" : ""),
+            style: `left:${pct(s.start)};width:${((s.end + s.outMs - s.start) / dur) * 100}%`,
+            title: `${s.scale.toFixed(1)}× · ${formatDuration(s.start)} → ${formatDuration(s.end)}`,
+          }, [h("span", {}, [s.scale.toFixed(1) + "×"]), h("span", { class: "x", title: "Remove", html: "&times;" })]);
+          b.querySelector(".x").addEventListener("click", (e) => {
+            e.stopPropagation();
+            edit.segments.splice(i, 1);
+            if (selected === s.id) selected = null;
+            recompute();
+          });
+          b.addEventListener("pointerdown", (e) => {
+            if (e.target.classList.contains("x")) return;
+            e.stopPropagation();
+            selected = s.id;
+            const startX = e.clientX, s0 = s.start, e0 = s.end;
+            const move = (ev) => {
+              const d = ((ev.clientX - startX) / track.getBoundingClientRect().width) * dur;
+              const len = e0 - s0;
+              s.start = clamp(s0 + d, 0, dur - len);
+              s.end = s.start + len;
+              recompute();
+            };
+            const up = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
+            addEventListener("pointermove", move);
+            addEventListener("pointerup", up);
+            paintTrack();
+          });
+          zoomrow.appendChild(b);
         });
-        if (k === style.background.value) b.classList.add("on");
-        sw.appendChild(b);
-      });
-      const none = h("button", { style: "background:#16181e;font-size:10px;color:#8b8e97", title: "No background" }, ["none"]);
-      none.addEventListener("click", () => {
-        style.background = { kind: "color", value: "#000000" };
-        [...sw.children].forEach((c) => c.classList.remove("on"));
-        none.classList.add("on");
-      });
-      sw.appendChild(none);
-      side.appendChild(sw);
+        // Click and keystroke marks: the evidence the zooms were planned from.
+        (rec.track.clicks || []).filter((c) => c.kind === "down").forEach((c) =>
+          zoomrow.parentNode && track.appendChild(h("div", { class: "clickmark", style: `left:${pct(c.t)}` }))
+        );
+      };
 
-      side.appendChild(h("h3", {}, ["Frame"]));
-      side.appendChild(slider("Padding", 0, 0.18, 0.005, style.padding, (v) => Math.round(v * 100) + "%", (v) => (style.padding = v)));
-      side.appendChild(slider("Radius", 0, 48, 1, style.radius, (v) => v + "px", (v) => (style.radius = v)));
-      side.appendChild(slider("Shadow", 0, 0.6, 0.02, style.shadow, (v) => Math.round((v / 0.6) * 100) + "%", (v) => (style.shadow = v)));
+      const repaintMarks = () => {
+        track.querySelectorAll(".clickmark,.keymark").forEach((n) => n.remove());
+        (rec.track.clicks || []).filter((c) => c.kind === "down").forEach((c) =>
+          track.appendChild(h("div", { class: "clickmark", style: `left:${pct(c.t)}` })));
+        (rec.track.keys || []).forEach((k) =>
+          track.appendChild(h("div", { class: "keymark", style: `left:${pct(k.t)}` })));
+      };
 
-      side.appendChild(h("h3", {}, ["Zoom"]));
-      side.appendChild(toggleRow("Automatic zoom", segments.length + " planned", style.zoom.enabled, (v) => { style.zoom.enabled = v; }));
-      side.appendChild(slider("Strength", 1.2, 3.2, 0.1, ZOOM_DEFAULTS.scale, (v) => v.toFixed(1) + "×", (v) => {
-        segments.forEach((s) => (s.scale = v));
-        keys = buildCameraTrack(segments);
-        paintTrack();
-      }));
-      side.appendChild(slider("Move speed", 400, 1600, 50, ZOOM_DEFAULTS.inMs, (v) => (v / 1000).toFixed(2) + "s", (v) => {
-        segments.forEach((s) => { s.inMs = v; s.outMs = Math.round(v * 0.78); });
-        keys = buildCameraTrack(segments);
-        paintTrack();
-      }));
+      const addZoomHere = () => {
+        const t = video.currentTime * 1000;
+        const c = cursorAt(rec.track.moves || [], t, style.cursor.smoothing);
+        edit.segments.push({
+          id: uuid(),
+          start: Math.max(0, t - 300),
+          end: Math.min(dur, t + 2400),
+          inMs: 800, outMs: 700, scale: 2,
+          x: c ? clamp(c.x / (rec.track.surface.w || srcW), 0, 1) : 0.5,
+          y: c ? clamp(c.y / (rec.track.surface.h || srcH), 0, 1) : 0.5,
+          auto: false, clicks: 1,
+        });
+        edit.segments.sort((a, b) => a.start - b.start);
+        recompute();
+      };
 
-      if (rec.meta.hasCursorTrack) {
-        side.appendChild(h("h3", {}, ["Cursor"]));
-        side.appendChild(toggleRow("Show cursor", "", style.cursor.show, (v) => (style.cursor.show = v)));
-        side.appendChild(slider("Size", 1, 4, 0.1, style.cursor.size, (v) => v.toFixed(2) + "×", (v) => (style.cursor.size = v)));
-        side.appendChild(slider("Smoothing", 0, 1, 0.01, style.cursor.smoothing, (v) => v.toFixed(2), (v) => (style.cursor.smoothing = v)));
-        side.appendChild(slider("Motion blur", 0, 1.2, 0.05, style.cursor.motionBlur, (v) => v.toFixed(2) + "×", (v) => (style.cursor.motionBlur = v)));
-        side.appendChild(slider("Click bounce", 0, 8, 0.1, style.cursor.clickBounce, (v) => v.toFixed(1) + "×", (v) => (style.cursor.clickBounce = v)));
-        side.appendChild(slider("Bounce speed", 120, 700, 10, style.cursor.bounceSpeedMs, (v) => v + "ms", (v) => (style.cursor.bounceSpeedMs = v)));
-      }
-
-      if (rec.meta.hasCamera) {
-        side.appendChild(h("h3", {}, ["Webcam"]));
-        side.appendChild(toggleRow("Show webcam", "", style.camera.show, (v) => (style.camera.show = v)));
-        side.appendChild(slider("Size", 0.1, 0.4, 0.01, style.camera.size, (v) => Math.round(v * 100) + "%", (v) => (style.camera.size = v)));
-        side.appendChild(slider("Position X", 0, 1, 0.01, style.camera.x, (v) => Math.round(v * 100) + "%", (v) => (style.camera.x = v)));
-        side.appendChild(slider("Position Y", 0, 1, 0.01, style.camera.y, (v) => Math.round(v * 100) + "%", (v) => (style.camera.y = v)));
-        side.appendChild(toggleRow("Mirror", "", style.camera.mirror, (v) => (style.camera.mirror = v)));
-      }
-
-      /* export */
-      const status = h("span", { class: "time" }, [
-        formatDuration(rec.meta.durationMs) + " · " + formatBytes(rec.meta.bytes) +
-        (rec.meta.droppedChunks ? " · " + rec.meta.droppedChunks + " chunks lost" : ""),
+      const tools = h("div", { style: "display:flex;gap:5px" }, [
+        h("button", { class: "tool", title: "Add a zoom at the playhead", onclick: addZoomHere }, ["+ Zoom"]),
+        h("button", { class: "tool", title: "Trim the start to the playhead", onclick: () => {
+          edit.trim.start = Math.min(video.currentTime * 1000, edit.trim.end - 400);
+          total.textContent = formatDuration(edit.trim.end - edit.trim.start); paintTrim(); touch();
+        } }, ["⇤ In"]),
+        h("button", { class: "tool", title: "Trim the end to the playhead", onclick: () => {
+          edit.trim.end = Math.max(video.currentTime * 1000, edit.trim.start + 400);
+          total.textContent = formatDuration(edit.trim.end - edit.trim.start); paintTrim(); touch();
+        } }, ["End ⇥"]),
+        h("button", { class: "tool", title: "Re-plan every zoom from the clicks", onclick: () => {
+          edit.segments = rec.meta.hasCursorTrack ? planZooms(rec.track, dur) : [];
+          recompute();
+        } }, ["Re-plan"]),
       ]);
-      const primary = h("button", { class: "primary" }, [o.onAttach ? "Attach to the issue" : "Save video"]);
-      const discard = h("button", {}, ["Discard"]);
+
+      /* inspector */
+      const pane = h("div", { class: "pane" });
+      const TABS = ["Look", "Zoom", "Cursor", "Camera"];
+      const tabs = h("div", { class: "tabs" });
+      let activeTab = "Look";
+
+      const paintPane = () => {
+        pane.innerHTML = "";
+        if (activeTab === "Look") {
+          pane.appendChild(h("h4", {}, ["Background"]));
+          const sw = h("div", { class: "swatches" });
+          const mark = (el) => { [...sw.children].forEach((c) => c.classList.remove("on")); el.classList.add("on"); };
+          Object.keys(GRADIENTS).forEach((k) => {
+            const b = h("button", { style: `background:linear-gradient(135deg,${GRADIENTS[k].join(",")})` });
+            if (style.background.kind === "gradient" && k === style.background.value) b.classList.add("on");
+            b.addEventListener("click", () => { style.background = { kind: "gradient", value: k }; mark(b); touch(); });
+            sw.appendChild(b);
+          });
+          const dark = h("button", { style: "background:#0b0c0f", title: "Solid" });
+          if (style.background.kind === "color") dark.classList.add("on");
+          dark.addEventListener("click", () => { style.background = { kind: "color", value: "#0b0c0f" }; mark(dark); touch(); });
+          sw.appendChild(dark);
+          pane.appendChild(sw);
+          pane.appendChild(h("h4", {}, ["Frame"]));
+          pane.appendChild(slider("Padding", 0, 0.18, 0.005, style.padding, (v) => Math.round(v * 100) + "%", (v) => { style.padding = v; touch(); }));
+          pane.appendChild(slider("Radius", 0, 48, 1, style.radius, (v) => v + "px", (v) => { style.radius = v; touch(); }));
+          pane.appendChild(slider("Shadow", 0, 0.6, 0.02, style.shadow, (v) => Math.round((v / 0.6) * 100) + "%", (v) => { style.shadow = v; touch(); }));
+        } else if (activeTab === "Zoom") {
+          pane.appendChild(h("h4", {}, [edit.segments.length + " zooms"]));
+          pane.appendChild(toggleCtl("Enabled", style.zoom.enabled, (v) => { style.zoom.enabled = v; touch(); }));
+          pane.appendChild(slider("Strength", 1.2, 3.2, 0.1, edit.segments[0] ? edit.segments[0].scale : 2, (v) => v.toFixed(1) + "×", (v) => {
+            edit.segments.forEach((s) => (s.scale = v)); recompute();
+          }));
+          pane.appendChild(slider("Move", 400, 1600, 50, edit.segments[0] ? edit.segments[0].inMs : 900, (v) => (v / 1000).toFixed(2) + "s", (v) => {
+            edit.segments.forEach((s) => { s.inMs = v; s.outMs = Math.round(v * 0.78); }); recompute();
+          }));
+          pane.appendChild(h("div", { class: "hint" }, [
+            "Drag a block on the timeline to move a zoom, or use + Zoom to add one at the playhead.",
+          ]));
+        } else if (activeTab === "Cursor") {
+          if (!rec.meta.hasCursorTrack) {
+            pane.appendChild(h("div", { class: "empty" }, ["No pointer data — this was a window or screen recording, so the system cursor is already in the picture."]));
+          } else {
+            pane.appendChild(toggleCtl("Show", style.cursor.show, (v) => { style.cursor.show = v; touch(); }));
+            pane.appendChild(slider("Size", 1, 4, 0.1, style.cursor.size, (v) => v.toFixed(2) + "×", (v) => { style.cursor.size = v; touch(); }));
+            pane.appendChild(slider("Smoothing", 0, 1, 0.01, style.cursor.smoothing, (v) => v.toFixed(2), (v) => { style.cursor.smoothing = v; touch(); }));
+            pane.appendChild(slider("Blur", 0, 1.2, 0.05, style.cursor.motionBlur, (v) => v.toFixed(2) + "×", (v) => { style.cursor.motionBlur = v; touch(); }));
+            pane.appendChild(slider("Bounce", 0, 8, 0.1, style.cursor.clickBounce, (v) => v.toFixed(1) + "×", (v) => { style.cursor.clickBounce = v; touch(); }));
+            pane.appendChild(slider("Speed", 120, 700, 10, style.cursor.bounceSpeedMs, (v) => v + "ms", (v) => { style.cursor.bounceSpeedMs = v; touch(); }));
+          }
+        } else {
+          if (!rec.meta.hasCamera) {
+            pane.appendChild(h("div", { class: "empty" }, ["No webcam was recorded."]));
+          } else {
+            pane.appendChild(toggleCtl("Show", style.camera.show, (v) => { style.camera.show = v; touch(); }));
+            pane.appendChild(toggleCtl("Mirror", style.camera.mirror, (v) => { style.camera.mirror = v; touch(); }));
+            pane.appendChild(slider("Size", 0.1, 0.4, 0.01, style.camera.size, (v) => Math.round(v * 100) + "%", (v) => { style.camera.size = v; touch(); }));
+            pane.appendChild(slider("X", 0, 1, 0.01, style.camera.x, (v) => Math.round(v * 100) + "%", (v) => { style.camera.x = v; touch(); }));
+            pane.appendChild(slider("Y", 0, 1, 0.01, style.camera.y, (v) => Math.round(v * 100) + "%", (v) => { style.camera.y = v; touch(); }));
+            const shape = h("div", { class: "ctl" }, [h("span", {}, ["Shape"])]);
+            ["circle", "rounded"].forEach((k) => {
+              const b = h("button", { class: "tool" }, [k]);
+              if (style.camera.shape === k) b.style.background = "#f59e0b", b.style.color = "#16130a";
+              b.addEventListener("click", () => { style.camera.shape = k; touch(); paintPane(); });
+              shape.appendChild(b);
+            });
+            pane.appendChild(shape);
+          }
+        }
+      };
+      TABS.forEach((t) => {
+        const b = h("button", { class: t === activeTab ? "on" : "" }, [t]);
+        b.addEventListener("click", () => {
+          activeTab = t;
+          [...tabs.children].forEach((c) => c.classList.toggle("on", c.textContent === t));
+          paintPane();
+        });
+        tabs.appendChild(b);
+      });
+
+      /* top bar */
+      const nm = h("input", { class: "nm", value: project.name });
+      nm.addEventListener("input", () => { project.name = nm.value; touch(); });
+      const stat = h("span", { class: "stat" }, [formatDuration(dur) + " · " + formatBytes(rec.meta.bytes || 0)]);
+      const primary = h("button", { class: "act primary" }, [o.onAttach ? "Attach to issue" : "Save video"]);
+      const close = h("button", { class: "act" }, ["Close"]);
       let cancelling = false;
 
-      discard.addEventListener("click", async () => {
+      close.addEventListener("click", async () => {
         cancelAnimationFrame(raf);
-        await store.remove(rec.meta.id).catch(() => {});
+        clearTimeout(saveTimer);
+        await saveProject(project).catch(() => {});
         teardown();
       });
 
+      const progress = h("div", { class: "progress" }, [h("i")]);
+
       primary.addEventListener("click", async () => {
-        primary.disabled = true;
-        discard.disabled = true;
+        primary.disabled = true; close.disabled = true;
         video.pause();
         const bar = progress.querySelector("i");
-        const t0 = performance.now();
         try {
           const out = await exportRecording({
             screenFile: rec.files.screen,
@@ -2580,23 +3030,26 @@
             meta: rec.meta,
             track: rec.track,
             style,
-            segments,
-            width: opts && opts.width ? opts.width : Math.min(1920, rec.meta.width),
-            height: opts && opts.height ? opts.height : undefined,
+            segments: edit.segments,
+            trim: edit.trim,
+            width: project.output.width,
             shouldCancel: () => cancelling,
             onProgress: (p) => {
               bar.style.width = (p.ratio * 100).toFixed(1) + "%";
-              status.textContent =
+              stat.textContent =
                 p.phase === "done"
                   ? "Finishing…"
-                  : `Rendering ${Math.round(p.ratio * 100)}% · ${p.speed ? p.speed.toFixed(1) + "× realtime" : ""}` +
-                    (p.eta ? " · " + formatDuration(p.eta * 1000) + " left" : "");
+                  : `Rendering ${Math.round(p.ratio * 100)}%` +
+                    (p.speed ? ` · ${p.speed.toFixed(1)}× realtime` : "") +
+                    (p.eta ? ` · ${formatDuration(p.eta * 1000)} left` : "");
             },
           });
           if (!out) return teardown();
-          status.textContent =
-            formatBytes(out.meta.bytes) + " · " + out.meta.frames + " frames · rendered in " +
-            formatDuration(out.meta.tookMs) + " (" + (rec.meta.durationMs / Math.max(1, out.meta.tookMs)).toFixed(1) + "× realtime)";
+          project.exports.unshift({ at: Date.now(), bytes: out.meta.bytes, width: out.meta.width, height: out.meta.height, frames: out.meta.frames });
+          await saveProject(project);
+          stat.textContent =
+            formatBytes(out.meta.bytes) + " · " + out.meta.frames + " frames · " +
+            ((edit.trim.end - edit.trim.start) / Math.max(1, out.meta.tookMs)).toFixed(1) + "× realtime";
           cancelAnimationFrame(raf);
           if (o.onAttach) {
             await o.onAttach(out.file, out.meta);
@@ -2604,35 +3057,68 @@
           } else {
             const a = document.createElement("a");
             a.href = URL.createObjectURL(out.file);
-            a.download = "tutorial-" + new Date(rec.meta.startedAt).toISOString().slice(0, 16).replace(/[:T]/g, "-") + ".webm";
+            a.download = project.name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-").toLowerCase() + ".webm";
             a.click();
-            primary.disabled = false;
-            primary.textContent = "Save again";
-            discard.disabled = false;
+            // The recording stays on disk: saving is not the end of editing.
+            primary.disabled = false; primary.textContent = "Save again";
+            close.disabled = false;
+            bar.style.width = "0";
+            draw();
           }
         } catch (e) {
-          status.textContent = "Export failed: " + ((e && e.message) || e);
-          primary.disabled = false;
-          discard.disabled = false;
+          stat.textContent = "Export failed: " + ((e && e.message) || e);
+          primary.disabled = false; close.disabled = false;
         }
       });
 
-      top.appendChild(h("span", {}, ["Studio"]));
-      top.appendChild(status);
-      top.appendChild(h("span", { class: "grow" }));
-      top.appendChild(discard);
-      top.appendChild(primary);
+      const top = h("div", { class: "top" }, [
+        h("span", { class: "mark" }, ["Studio"]),
+        nm, stat,
+        h("span", { class: "grow" }),
+        close, primary,
+      ]);
 
-      wrap.appendChild(top);
-      wrap.appendChild(stage);
-      wrap.appendChild(side);
-      wrap.appendChild(transport);
-      wrap.appendChild(progress);
-      ui.layer.appendChild(h("div", { class: "scrim" }));
+      const bottom = h("div", { class: "bottom" }, [
+        h("div", { class: "tbar" }, [
+          play, cur, h("span", { class: "time" }, ["/"]), total,
+          h("span", { style: "width:8px" }),
+          tools,
+          h("span", { class: "grow", style: "flex:1" }),
+          h("span", { class: "time" }, [(rec.track.clicks || []).filter((c) => c.kind === "down").length + " clicks"]),
+        ]),
+        track,
+      ]);
+
+      track.appendChild(zoomrow);
+      track.appendChild(trimL); track.appendChild(trimR);
+      track.appendChild(handleL); track.appendChild(handleR);
+      track.appendChild(playhead);
+
+      const side = h("div", { class: "side" }, [tabs, pane]);
+      wrap.appendChild(top); wrap.appendChild(stage); wrap.appendChild(side);
+      wrap.appendChild(bottom); wrap.appendChild(progress);
       ui.layer.appendChild(wrap);
 
-      paintTrack();
-      video.addEventListener("loadeddata", () => { video.currentTime = 0; draw(); }, { once: true });
+      paintPane(); repaintMarks(); paintTrack(); paintTrim();
+      video.addEventListener("loadeddata", () => { seekTo(edit.trim.start); draw(); }, { once: true });
+
+      // An agent editing the project from MCP lands here.
+      const onExternal = (e) => {
+        if (!e.detail || e.detail.id !== project.id) return;
+        loadProject(project.id).then((fresh) => {
+          if (!fresh) return;
+          project.edit = migrateProject(fresh, rec).edit;
+          project.name = fresh.name || project.name;
+          nm.value = project.name;
+          Object.assign(style, project.edit.style);
+          edit.trim = project.edit.trim;
+          edit.segments = project.edit.segments;
+          keys = buildCameraTrack(edit.segments);
+          paintPane(); paintTrack(); paintTrim();
+          total.textContent = formatDuration(edit.trim.end - edit.trim.start);
+        });
+      };
+      addEventListener("pinstage:project-external", onExternal);
     }
 
     preflight();
@@ -2647,6 +3133,9 @@
     buildCameraTrack,
     startCapture,
     startSession,
+    listCameras,
+    onCameraChange,
+    classifyCamera,
     renderFrame,
     framedRect,
     paintBackground,
@@ -2656,6 +3145,13 @@
     demuxWebM,
     packetStream,
     exportRecording,
+    newProject,
+    migrateProject,
+    saveProject,
+    loadProject,
+    listRecordings,
+    openRecording,
+    PROJECT_VERSION,
     open,
     pickVideoCodec,
     STYLE_DEFAULTS,
