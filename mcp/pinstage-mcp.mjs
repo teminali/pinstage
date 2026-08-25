@@ -96,10 +96,12 @@ function ghToken() {
 const HEADERS = { apikey: KEY, Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" };
 
 async function rest(path, init = {}) {
+  const sentAt = Date.now();
   const res = await fetch(`${URL_BASE.replace(/\/$/, "")}/rest/v1/${path}`, {
     ...init,
     headers: { ...HEADERS, ...init.headers },
   });
+  clock.observe(res.headers.get("date"), sentAt, Date.now());
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   // Prefer: return=minimal answers 201/204 with an EMPTY body - parse text,
   // never res.json() blindly, or inserts crash after succeeding.
@@ -107,7 +109,79 @@ async function rest(path, init = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-const ts = () => ({ _ts: Date.now() });
+/* ── clock ─────────────────────────────────────────────────────────────────
+ *  This process stamps timestamps that a teammate's BROWSER reads back, and
+ *  reads timestamps that browser wrote. A developer laptop whose clock has
+ *  drifted (or that just woke from sleep) therefore does not merely mislead
+ *  itself - it publishes wrong elapsed times to everyone watching staging.
+ *  Every PostgREST response carries a server-generated `Date`, which is the
+ *  one clock both ends already share, so calibrate against it and stamp on
+ *  that timeline. Deliberate twin of the `clock` object in pinstage.js.   */
+const clock = {
+  offset: 0,
+  rtt: Infinity,
+  at: 0,
+  observe(header, sentAt, gotAt) {
+    const server = Date.parse(header || "");
+    if (!Number.isFinite(server)) return;
+    const rtt = gotAt - sentAt;
+    if (rtt > this.rtt && gotAt - this.at < 300000) return;
+    // `Date` is whole-second, so the instant it names is uniformly spread over
+    // the second that follows: +500ms is its mean.
+    this.offset = server + 500 - (sentAt + gotAt) / 2;
+    this.rtt = rtt;
+    this.at = gotAt;
+  },
+  now() {
+    return Date.now() + this.offset;
+  },
+};
+
+const ts = () => ({ _ts: clock.now() });
+
+/* ── status transitions ────────────────────────────────────────────────────
+ *  Deliberate twin of `applyStatusTransition` in pinstage.js - change one,
+ *  change the other. The phase anchors are stamped ONCE, by the transition
+ *  that starts the phase, and never moved again; the toolbar's elapsed timer
+ *  reads them. Before this, set_status wrote only `lastActivityAt`, so every
+ *  progress note this server posted reset the user-visible timer to zero, and
+ *  `claimedBy` - which the conflict lock and the "[IN PROGRESS - Claimed by
+ *  …]" header both read - was never written at all.                       */
+const WORKING_STATUSES = { in_progress: 1, deploying: 1 };
+
+function applyStatusTransition(data, status, actor) {
+  const t = ts();
+  data.status = status;
+  data.lastActivityAt = t;
+
+  if (WORKING_STATUSES[status]) {
+    if (!data.workStartedAt) data.workStartedAt = t;
+    if (status === "deploying") {
+      if (!data.deployStartedAt) data.deployStartedAt = t;
+    } else if (data.deployStartedAt && !data.deployEndedAt) {
+      data.deployEndedAt = t;
+    }
+    if (!data.claimedBy || data.claimedBy.uid !== actor.uid) {
+      data.claimedBy = { uid: actor.uid, name: actor.name, author: actor.name, at: t };
+    }
+    delete data.workEndedAt;
+  } else {
+    if (data.deployStartedAt && !data.deployEndedAt) data.deployEndedAt = t;
+    if (data.workStartedAt && !data.workEndedAt) data.workEndedAt = t;
+  }
+
+  if (status === "open") {
+    // Released, not finished: the part-measured run is void.
+    delete data.workStartedAt;
+    delete data.workEndedAt;
+    delete data.deployStartedAt;
+    delete data.deployEndedAt;
+    delete data.claimedBy;
+  }
+  return data;
+}
+
+const MCP_ACTOR = { uid: "mcp", name: AUTHOR };
 const when = (t) => (t?._ts ? new Date(t._ts).toISOString().replace("T", " ").slice(0, 16) : "?");
 const activity = (d) => d.lastActivityAt?._ts ?? d.createdAt?._ts ?? 0;
 
@@ -297,6 +371,26 @@ function targetSignature(d) {
   return "global";
 }
 
+const claimant = (d) => d.claimedBy?.name || d.claimedBy?.author || "Agent";
+
+/* How long the current phase has been running, on the same anchors the
+ * toolbar's timer reads - so the queue an agent sees and the badge a
+ * teammate watches can never quote different numbers. */
+function elapsedTag(d) {
+  const start =
+    d.status === "deploying"
+      ? d.deployStartedAt?._ts ?? d.workStartedAt?._ts
+      : d.workStartedAt?._ts;
+  const anchor = start ?? d.claimedBy?.at?._ts ?? d.claimedBy?.claimedAt?._ts;
+  if (!anchor) return "";
+  const s = Math.max(0, Math.floor((clock.now() - anchor) / 1000));
+  if (s < 60) return ` · ${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return ` · ${m}m ${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return ` · ${h}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
 /* withContext: the list view wants the element and source inline; the detail
  * view suppresses them because the full Context block follows. */
 function threadLine({ id, data: d }, withContext = true, lockedSignatures = new Map()) {
@@ -305,9 +399,9 @@ function threadLine({ id, data: d }, withContext = true, lockedSignatures = new 
   let safetyTag = "";
 
   if (d.status === "in_progress") {
-    statusHeader = `[🔵 IN PROGRESS - Claimed by ${d.claimedBy?.author || "Agent"}]`;
+    statusHeader = `[🔵 IN PROGRESS - Claimed by ${claimant(d)}${elapsedTag(d)}]`;
   } else if (d.status === "deploying") {
-    statusHeader = `[🟣 DEPLOYING - Building staging by ${d.claimedBy?.author || "Agent"}]`;
+    statusHeader = `[🟣 DEPLOYING - Building staging by ${claimant(d)}${elapsedTag(d)}]`;
   } else if (d.status === "deployed") {
     statusHeader = `[🟢 DEPLOYED - Ready to verify]`;
   } else if (d.status === "open") {
@@ -536,7 +630,7 @@ const TOOLS = [
         if (st === "in_progress" || st === "deploying") {
           const sig = targetSignature(r.data);
           if (sig && sig !== "global") {
-            lockedSignatures.set(sig, { id: r.id, author: r.data?.claimedBy?.author || "Another agent" });
+            lockedSignatures.set(sig, { id: r.id, author: claimant(r.data || {}) });
           }
         }
       });
@@ -610,12 +704,8 @@ const TOOLS = [
     handler: async ({ id, status, note }) => {
       const t = await getThread(id);
       if (note) await postComment(id, note);
-      const data = {
-        ...t.data,
-        status,
-        lastActivityAt: ts(),
-        messageCount: (t.data.messageCount || 0) + (note ? 1 : 0),
-      };
+      const data = applyStatusTransition({ ...t.data }, status, MCP_ACTOR);
+      data.messageCount = (t.data.messageCount || 0) + (note ? 1 : 0);
       if (status === "resolved") {
         data.resolvedBy = { uid: "mcp", name: AUTHOR };
         data.resolvedAt = ts();
@@ -642,14 +732,11 @@ const TOOLS = [
     handler: async ({ id, note }) => {
       const t = await getThread(id);
       if (note) await postComment(id, note);
-      await patchThread(id, {
-        ...t.data,
-        status: "resolved",
-        resolvedBy: { uid: "mcp", name: AUTHOR },
-        resolvedAt: ts(),
-        lastActivityAt: ts(),
-        messageCount: (t.data.messageCount || 0) + (note ? 1 : 0),
-      });
+      const data = applyStatusTransition({ ...t.data }, "resolved", MCP_ACTOR);
+      data.resolvedBy = { uid: "mcp", name: AUTHOR };
+      data.resolvedAt = ts();
+      data.messageCount = (t.data.messageCount || 0) + (note ? 1 : 0);
+      await patchThread(id, data);
       return `Resolved ${id}${note ? " with a closing reply" : ""}.`;
     },
   },
@@ -667,7 +754,8 @@ const TOOLS = [
     handler: async ({ id, note }) => {
       const t = await getThread(id);
       if (note) await postComment(id, note);
-      const data = { ...t.data, status: "open", lastActivityAt: ts(), messageCount: (t.data.messageCount || 0) + (note ? 1 : 0) };
+      const data = applyStatusTransition({ ...t.data }, "open", MCP_ACTOR);
+      data.messageCount = (t.data.messageCount || 0) + (note ? 1 : 0);
       delete data.resolvedBy;
       delete data.resolvedAt;
       await patchThread(id, data);
