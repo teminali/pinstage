@@ -376,11 +376,23 @@
       }
     }
 
-    let segs = clusters.map((k) => ({
+    // How far the camera must travel to reach each target, as a fraction of
+    // the frame. Giving a move across the whole screen the same 900ms as a
+    // small nudge is what makes an automatic zoom feel mechanical — real
+    // camera moves are timed to their distance.
+    let prevX = 0.5, prevY = 0.5;
+    const travel = clusters.map((k) => {
+      const d = Math.hypot(k.cx / W - prevX, k.cy / H - prevY);
+      prevX = k.cx / W;
+      prevY = k.cy / H;
+      return d;
+    });
+
+    let segs = clusters.map((k, i) => ({
       id: uuid(),
       start: Math.max(0, k.first - o.leadInMs),
       end: Math.min(durationMs, k.last + o.holdAfterMs),
-      inMs: o.inMs,
+      inMs: Math.round(o.inMs * (0.68 + Math.min(1, travel[i] / 0.5) * 0.66)),
       outMs: o.outMs,
       scale: o.scale,
       x: k.cx / W,
@@ -1052,7 +1064,14 @@
       sway: 0.13,
     },
     camera: { show: true, shape: "circle", size: 0.22, x: 0.98, y: 0.98, mirror: true },
-    zoom: { enabled: true },
+    zoom: {
+      enabled: true,
+      // Sub-frame samples accumulated while the camera moves. Costs render
+      // time only during moves; a held shot pays nothing and stays sharp.
+      motionBlur: 0.85,
+      // A held frame that is perfectly still reads as a screenshot with audio.
+      drift: 0.5,
+    },
   };
 
   const GRADIENTS = {
@@ -1356,48 +1375,113 @@
     const base = framedRect(W, H, srcW, srcH, st.padding);
     const cam = st.zoom.enabled && keys ? cameraAt(keys, t) : { scale: 1, x: 0.5, y: 0.5 };
 
-    // A perfectly still held frame reads as a screenshot with audio. This is a
-    // drift slow and small enough never to be noticed and always to be felt,
-    // and it is a pure function of t, so seeking stays exact.
-    const driftAmt = (st.zoom.drift == null ? 0.5 : st.zoom.drift) * (cam.scale > 1.02 ? 1 : 0);
-    const dx = Math.sin(t / 4300) * 0.0016 * driftAmt;
-    const dy = Math.cos(t / 5700) * 0.0013 * driftAmt;
+    // A perfectly still held frame reads as a screenshot with audio, so the
+    // camera drifts — slowly and slightly enough never to be noticed and
+    // always to be felt. It is a pure function of t, so seeking stays exact.
 
     // The camera scales about the point of interest, expressed in the SOURCE's
     // normalised space, so a zoom target stays on the same pixel regardless of
     // how the frame happens to be letterboxed.
-    const g = guardFocus(base, cam.scale, W, H);
-    const fx = g.loX > g.hiX ? base.x + base.w / 2 : clamp(base.x + base.w * (cam.x + dx), g.loX, g.hiX);
-    const fy = g.loY > g.hiY ? base.y + base.h / 2 : clamp(base.y + base.h * (cam.y + dy), g.loY, g.hiY);
     const cx = W / 2, cy = H / 2;
 
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.scale(cam.scale, cam.scale);
-    ctx.translate(-fx, -fy);
+    const driftAt = (tt, scale) => {
+      const a = (st.zoom.drift == null ? 0.5 : st.zoom.drift) * (scale > 1.02 ? 1 : 0);
+      return { dx: Math.sin(tt / 4300) * 0.0016 * a, dy: Math.cos(tt / 5700) * 0.0013 * a };
+    };
 
-    // Shadow under the frame, drawn once, not per element.
+    const focusFor = (camS, tt) => {
+      const gg = guardFocus(base, camS.scale, W, H);
+      const d = driftAt(tt, camS.scale);
+      return {
+        fx: gg.loX > gg.hiX ? base.x + base.w / 2 : clamp(base.x + base.w * (camS.x + d.dx), gg.loX, gg.hiX),
+        fy: gg.loY > gg.hiY ? base.y + base.h / 2 : clamp(base.y + base.h * (camS.y + d.dy), gg.loY, gg.hiY),
+      };
+    };
+
+    const applyCam = (camS, f) => {
+      ctx.translate(cx, cy);
+      ctx.scale(camS.scale, camS.scale);
+      ctx.translate(-f.fx, -f.fy);
+    };
+
+    /* Motion blur on the CAMERA, not just the cursor.
+     *
+     * A push-in rendered as a stack of perfectly sharp stills is the giveaway
+     * of a cheap screen recording: real footage smears while it moves, and the
+     * eye reads the absence of that smear as "this was faked in software".
+     *
+     * The camera is sampled several times across one shutter interval and the
+     * results averaged. Averaging with source-over needs the alpha of the i-th
+     * layer to be 1/(i+1) — that keeps a running mean, where a flat 1/N would
+     * let the last sample dominate and simply look like a dimmer single frame.
+     *
+     * It only engages while the camera is actually moving, so a held shot
+     * costs exactly one draw and stays razor sharp.
+     */
+    const blurAmt = st.zoom.motionBlur == null ? 0.85 : st.zoom.motionBlur;
+    let samples = [{ cam, t }];
+    if (blurAmt > 0 && keys && st.zoom.enabled) {
+      const shutter = 17 * blurAmt;
+      const prev = cameraAt(keys, t - shutter);
+      // How far the picture actually travelled on screen, in output pixels —
+      // the only measure that matters, since a scale change at 3x moves far
+      // more of the frame than the same change at 1.1x.
+      // A scale change does not move the centre of the frame at all and moves
+      // its edges most, so it is weighted by the half-diagonal of the OUTPUT —
+      // the furthest any pixel travels. Weighting it by the full frame width
+      // over-reports, and over-reporting here costs real render time for blur
+      // nobody can see.
+      const moved =
+        Math.hypot((prev.x - cam.x) * base.w * cam.scale, (prev.y - cam.y) * base.h * cam.scale) +
+        (Math.abs(prev.scale - cam.scale) / Math.max(0.001, cam.scale)) * Math.hypot(W, H) * 0.5;
+      if (moved > 3) {
+        const n = clamp(Math.round(moved / 5), 2, 5);
+        samples = [];
+        for (let i = n - 1; i >= 0; i--) {
+          const tt = t - (i / n) * shutter;
+          samples.push({ cam: cameraAt(keys, tt), t: tt });
+        }
+      }
+    }
+    const primary = samples[samples.length - 1];
+    const primaryFocus = focusFor(primary.cam, primary.t);
+
+    // Shadow under the frame, at the primary position and drawn once — once per
+    // sample would stack into a bruise.
     if (st.shadow > 0) {
       ctx.save();
+      applyCam(primary.cam, primaryFocus);
       ctx.shadowColor = `rgba(0,0,0,${st.shadow})`;
-      ctx.shadowBlur = (Math.min(W, H) * 0.045) / cam.scale;
-      ctx.shadowOffsetY = (Math.min(W, H) * 0.018) / cam.scale;
+      ctx.shadowBlur = (Math.min(W, H) * 0.045) / primary.cam.scale;
+      ctx.shadowOffsetY = (Math.min(W, H) * 0.018) / primary.cam.scale;
       ctx.fillStyle = "#000";
       roundRectPath(ctx, base.x, base.y, base.w, base.h, st.radius);
       ctx.fill();
       ctx.restore();
     }
 
-    ctx.save();
-    roundRectPath(ctx, base.x, base.y, base.w, base.h, st.radius);
-    ctx.clip();
-    if (src) ctx.drawImage(src, base.x, base.y, base.w, base.h);
+    samples.forEach((sm, i) => {
+      ctx.save();
+      ctx.globalAlpha = 1 / (i + 1);
+      applyCam(sm.cam, focusFor(sm.cam, sm.t));
+      roundRectPath(ctx, base.x, base.y, base.w, base.h, st.radius);
+      ctx.clip();
+      if (src) ctx.drawImage(src, base.x, base.y, base.w, base.h);
+      ctx.restore();
+    });
 
     // The cursor lives INSIDE the clip and inside the camera transform, so it
-    // scales with the picture exactly as a real cursor on a zoomed screen would.
+    // scales with the picture exactly as a real cursor on a zoomed screen
+    // would — but it is drawn once, sharp, at the primary position. It carries
+    // its own trail; smearing it twice would just make it mud.
     if (st.cursor.show && track && track.moves && track.moves.length) {
       const c = cursorAt(track.moves, t, st.cursor.smoothing);
       if (c) {
+        ctx.save();
+        applyCam(primary.cam, primaryFocus);
+        roundRectPath(ctx, base.x, base.y, base.w, base.h, st.radius);
+        ctx.clip();
+
         const sw = track.surface.w || srcW, sh = track.surface.h || srcH;
         const px = base.x + (c.x / sw) * base.w;
         const py = base.y + (c.y / sh) * base.h;
@@ -1410,8 +1494,8 @@
           phase == null ? 0 : Math.sin(phase * Math.PI) * (st.cursor.clickBounce / 100);
         const scale = unit * (1 - bounce);
 
-        // Motion blur is the trail the eye expects behind something moving
-        // fast. Sampled backwards along the real path, so it curves.
+        // The trail the eye expects behind something moving fast, sampled
+        // backwards along the real path so it curves.
         const speed = Math.hypot(c.vx, c.vy);
         const trail = Math.min(6, Math.round(speed * st.cursor.motionBlur * 0.12));
         for (let i = trail; i > 0; i--) {
@@ -1440,10 +1524,9 @@
         }
 
         drawCursor(ctx, px, py, scale, 1);
+        ctx.restore();
       }
     }
-    ctx.restore(); // clip
-    ctx.restore(); // camera
 
     // The webcam sits OUTSIDE the camera transform: a picture-in-picture that
     // zoomed with the screen would be unwatchable.
@@ -3546,8 +3629,17 @@
           pane.appendChild(slider("Move", 400, 1600, 50, edit.segments[0] ? edit.segments[0].inMs : 900, (v) => (v / 1000).toFixed(2) + "s", (v) => {
             edit.segments.forEach((s) => { s.inMs = v; s.outMs = Math.round(v * 0.78); }); recompute();
           }));
+          pane.appendChild(h("h4", {}, ["Feel"]));
+          pane.appendChild(slider("Motion blur", 0, 1.4, 0.05,
+            style.zoom.motionBlur == null ? 0.85 : style.zoom.motionBlur,
+            (v) => (v ? v.toFixed(2) + "×" : "off"), (v) => { style.zoom.motionBlur = v; touch(); }));
+          pane.appendChild(slider("Drift", 0, 1.5, 0.05,
+            style.zoom.drift == null ? 0.5 : style.zoom.drift,
+            (v) => (v ? v.toFixed(2) + "×" : "off"), (v) => { style.zoom.drift = v; touch(); }));
           pane.appendChild(h("div", { class: "hint" }, [
-            "Drag a block on the timeline to move a zoom, or use + Zoom to add one at the playhead.",
+            "Drag a block on the timeline to move a zoom, or use + Zoom to add one at the playhead. " +
+            "Motion blur only renders while the camera is moving — it roughly halves export speed on " +
+            "move-heavy footage and costs nothing on held shots.",
           ]));
         } else if (activeTab === "Text") {
           pane.appendChild(
