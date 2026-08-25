@@ -18,6 +18,8 @@ const ok = (label, cond, extra = "") => {
 };
 const near = (label, got, want, tol) =>
   ok(label, Math.abs(got - want) <= tol, `(${typeof got === "number" ? got.toFixed(3) : got})`);
+const eq = (label, got, want) =>
+  ok(label, JSON.stringify(got) === JSON.stringify(want), `(got ${JSON.stringify(got)})`);
 
 const surface = { w: 1440, h: 900, dpr: 2 };
 const track = (clicks) => ({ surface, clicks: clicks.map(([t, x, y]) => ({ t, x, y, kind: "down" })), moves: [] });
@@ -129,6 +131,56 @@ ok("0:05", S.formatDuration(5000) === "0:05", `(${S.formatDuration(5000)})`);
 ok("2:56", S.formatDuration(176000) === "2:56", `(${S.formatDuration(176000)})`);
 ok("3 hours of tutorial", S.formatDuration(3 * 3600e3 + 61e3) === "3:01:01", `(${S.formatDuration(3 * 3600e3 + 61e3)})`);
 ok("1.4 GB", S.formatBytes(1.4 * 1073741824) === "1.40 GB", `(${S.formatBytes(1.4 * 1073741824)})`);
+
+
+console.log("\nclips — normalising");
+const D = 20000;
+let cs = S.normalizeClips([{ srcStart: 5000, srcEnd: 9000 }, { srcStart: 0, srcEnd: 3000 }], D);
+eq("sorted into source order", cs.map((c) => c.srcStart), [0, 5000]);
+eq("slivers are dropped", S.normalizeClips([{ srcStart: 0, srcEnd: 30 }], D).length, 0);
+cs = S.normalizeClips([{ srcStart: 0, srcEnd: 6000 }, { srcStart: 4000, srcEnd: 9000 }], D);
+ok("overlaps are resolved, never doubled", cs[1].srcStart >= cs[0].srcEnd, `(${cs[0].srcEnd} -> ${cs[1].srcStart})`);
+const clamped = S.normalizeClips([{ srcStart: -500, srcEnd: 99999 }], D)[0];
+eq("out of range is clamped", [clamped.srcStart, clamped.srcEnd], [0, D]);
+ok("and every clip gets an id", !!clamped.id);
+
+console.log("\nclips — the two clocks");
+let tl = S.buildTimeline([{ srcStart: 2000, srcEnd: 5000 }, { srcStart: 9000, srcEnd: 12000 }], D);
+eq("clips lie end to end in output time", tl.map((c) => [c.outStart, c.outEnd]), [[0, 3000], [3000, 6000]]);
+eq("cutting the middle shortens the film", S.timelineDuration(tl), 6000);
+eq("output 0 is the first clip's start", S.outToSrc(tl, 0).src, 2000);
+eq("output 3500 lands in the second clip", Math.round(S.outToSrc(tl, 3500).src), 9500);
+eq("source 9500 maps back to output 3500", Math.round(S.srcToOut(tl, 9500)), 3500);
+eq("a cut-out moment maps to nothing", S.srcToOut(tl, 7000), null);
+eq("source before everything maps to nothing", S.srcToOut(tl, 100), null);
+
+console.log("\nclips — speed");
+tl = S.buildTimeline([{ srcStart: 0, srcEnd: 8000, speed: 2 }], D);
+eq("2x halves the output length", S.timelineDuration(tl), 4000);
+eq("output 1000 is source 2000 at 2x", S.outToSrc(tl, 1000).src, 2000);
+tl = S.buildTimeline([{ srcStart: 0, srcEnd: 4000, speed: 0.5 }], D);
+eq("half speed doubles the output length", S.timelineDuration(tl), 8000);
+ok("speed is clamped to something sane", S.normalizeClips([{ srcStart: 0, srcEnd: 9000, speed: 99 }], D)[0].speed === 4);
+
+console.log("\nclips — split");
+let base = [{ id: "one", srcStart: 0, srcEnd: 10000, speed: 1 }];
+let after = S.splitAt(base, D, 4000);
+eq("a split makes two clips", after.length, 2);
+eq("the cut lands on the playhead", [after[0].srcEnd, after[1].srcStart], [4000, 4000]);
+eq("total duration is unchanged by a split", S.timelineDuration(S.buildTimeline(after, D)), 10000);
+ok("splitting at the very start is refused", S.splitAt(base, D, 20).length === 1);
+ok("splitting at the very end is refused", S.splitAt(base, D, 9990).length === 1);
+after = S.splitAt(base, D, 4000);
+const dropped = after.filter((c) => c !== after[0]);
+eq("deleting the first half leaves the second", S.timelineDuration(S.buildTimeline(dropped, D)), 6000);
+eq("and it now starts at output zero", S.buildTimeline(dropped, D)[0].outStart, 0);
+
+console.log("\nclips — split then speed the tail");
+after = S.splitAt(base, D, 6000);
+after[1].speed = 2;
+tl = S.buildTimeline(after, D);
+eq("6s at 1x plus 4s at 2x = 8s", S.timelineDuration(tl), 8000);
+eq("the seam is continuous", tl[0].outEnd, tl[1].outStart);
 
 console.log(fails ? `\n${fails} FAILED\n` : "\nall passed\n");
 process.exit(fails ? 1 : 0);
