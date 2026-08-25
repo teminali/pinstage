@@ -447,6 +447,24 @@
   }
 
   /**
+   * Keep the framed picture covering the canvas.
+   *
+   * Zooming about a point near an edge slides the frame off the canvas and
+   * reveals the background behind it — a bright band down one side, in the
+   * middle of a push-in. It is the most common tell of an automatic zoom.
+   * This gives the range the focus point must stay inside for the scaled frame
+   * to still cover the output.
+   */
+  function guardFocus(base, scale, W, H) {
+    const halfW = W / (2 * scale);
+    const halfH = H / (2 * scale);
+    return {
+      loX: base.x + halfW, hiX: base.x + base.w - halfW,
+      loY: base.y + halfH, hiY: base.y + base.h - halfH,
+    };
+  }
+
+  /**
    * The camera at time t, read off a keyframe track from buildCameraTrack.
    * Pure interpolation between two neighbours — so it is continuous by
    * construction, seekable, and identical whether the frame is being played,
@@ -605,7 +623,7 @@
 
   async function startCapture(opts) {
     const o = Object.assign(
-      { source: "tab", mic: true, systemAudio: false, camera: false, cameraDeviceId: null, fps: 30 },
+      { source: "tab", mic: true, systemAudio: false, camera: false, cameraDeviceId: null, fps: 60 },
       opts || {}
     );
 
@@ -618,6 +636,15 @@
     // replace it with, so it is left alone.
     const display = await navigator.mediaDevices.getDisplayMedia({
       video: {
+        // Asked for explicitly. Without a resolution constraint Chrome is free
+        // to hand back a downscaled surface, and nothing downstream can ever
+        // recover the detail it did not capture — a 2K export from a 1280-wide
+        // recording is a stretched 1280-wide recording. `ideal` never upscales
+        // past the real surface, so this asks for native and takes what exists.
+        width: { ideal: 3840 },
+        height: { ideal: 2160 },
+        // 60 wherever the surface can do it. A camera move that jumps 40px
+        // between frames at 30fps reads as a slideshow no easing can fix.
         frameRate: { ideal: o.fps, max: 60 },
         cursor: wantsOwnCursor ? "never" : "always",
       },
@@ -736,12 +763,24 @@
    * they arrive and never retained, so memory is flat whether this runs for two
    * minutes or three hours.
    */
-  async function recordToDisk(stream, recordingId, filename, mime) {
+  /**
+   * Bitrate for a given picture. A flat number is the classic mistake here:
+   * 8 Mbps is generous for 720p and visibly lossy on 2K screen content, where
+   * the thing being compressed is small text on flat colour — exactly what
+   * block artefacts ruin. Scaling with the pixel count keeps quality constant
+   * across sizes instead of keeping the FILE constant.
+   */
+  function bitrateFor(w, h, fps, factor) {
+    const bits = w * h * (fps || 30) * (factor || 0.13);
+    return Math.round(clamp(bits, 3_000_000, 48_000_000));
+  }
+
+  async function recordToDisk(stream, recordingId, filename, mime, bitrate) {
     const writer = await store.writer(recordingId, filename);
     const rec = new MediaRecorder(stream, {
       mimeType: mime || undefined,
-      videoBitsPerSecond: 8_000_000,
-      audioBitsPerSecond: 128_000,
+      videoBitsPerSecond: bitrate || 8_000_000,
+      audioBitsPerSecond: 160_000,
     });
 
     // Chunks must reach disk IN ORDER. `ondataavailable` can fire again while
@@ -803,9 +842,15 @@
     // t=0 is the first written byte, not the moment the picker was accepted.
     const origin = performance.now();
 
-    const screen = await recordToDisk(cap.screenStream, id, "screen.webm", mime);
+    // The source is recorded at the quality the capture can actually deliver;
+    // every export afterwards is bounded by this number.
+    const screenBitrate = bitrateFor(cap.width, cap.height, cap.fps, 0.13);
+    const screen = await recordToDisk(cap.screenStream, id, "screen.webm", mime, screenBitrate);
     const cameraRec = cap.cameraStream
-      ? await recordToDisk(cap.cameraStream, id, "camera.webm", mime)
+      ? await recordToDisk(
+          cap.cameraStream, id, "camera.webm", mime,
+          bitrateFor(cap.cameraWidth || 1280, cap.cameraHeight || 720, cap.fps, 0.11)
+        )
       : null;
 
     // The pointer track only exists when the capture is this tab; anywhere else
@@ -816,6 +861,11 @@
     let pausedAt = 0;
     let pausedTotal = 0;
     const markers = [];
+    // Every window in which our own recording HUD was on screen. It tucks
+    // itself away after a couple of seconds, but reaching for Stop brings it
+    // back — so the last moments of a recording reliably contain our toolbar.
+    // Knowing exactly when lets the edit cut it off by default.
+    const uiVisible = [];
 
     const elapsed = () => (paused ? pausedAt : performance.now()) - origin - pausedTotal;
 
@@ -834,6 +884,15 @@
       },
       get counts() {
         return track ? track.counts : { moves: 0, clicks: 0 };
+      },
+      /** Told by the UI whenever its own chrome becomes visible or hides. */
+      noteUiVisible(shown) {
+        const t = elapsed();
+        if (shown) uiVisible.push({ from: t, to: null });
+        else {
+          const last = uiVisible[uiVisible.length - 1];
+          if (last && last.to == null) last.to = t;
+        }
       },
       /** A manual "zoom here" beat, for when the interesting thing was not a click. */
       mark() {
@@ -865,6 +924,9 @@
 
         const data = track ? track.data : { moves: [], clicks: [], keys: [], scrolls: [], surface: { w: cap.width, h: cap.height, dpr: 1 } };
         data.markers = markers;
+        const openRun = uiVisible[uiVisible.length - 1];
+        if (openRun && openRun.to == null) openRun.to = durationMs;
+        data.uiVisible = uiVisible;
 
         const meta = {
           id,
@@ -881,16 +943,88 @@
           cameraHeight: cap.cameraHeight,
           hasAudio: cap.hasAudio,
           bytes: session.bytes,
+          bitrate: screenBitrate,
           droppedChunks: screen.dropped + (cameraRec ? cameraRec.dropped : 0),
         };
         await store.writeJson(id, "track.json", data);
         await store.writeJson(id, "meta.json", meta);
+        await store.writeJson(id, "manifest.json", buildManifest(meta));
         return { meta, track: data, files };
       },
     };
 
     cap.onSurfaceEnded(() => h.onSurfaceEnded && h.onSurfaceEnded(session));
     return session;
+  }
+
+  /* ── manifest ────────────────────────────────────────────────────────────
+   * Nothing is ever burned into a source. The screen track holds the screen and
+   * only the screen — no cursor (it is captured with cursor:"never" and drawn
+   * from data), no webcam, no zoom, no caption, no background. The webcam is a
+   * second file at full resolution. Every effect happens at render time, from
+   * the edit.
+   *
+   * That is what makes an edit reversible: changing a zoom, moving the face
+   * shot, or rewriting a caption re-renders from pristine sources rather than
+   * compounding onto an already-processed picture. Render, adjust, render
+   * again, forever, with no generation loss.
+   *
+   * This file states that contract explicitly so an agent reading the folder
+   * knows which asset to reach for and which never to treat as final.
+   */
+  function buildManifest(meta) {
+    return {
+      manifestVersion: 1,
+      recordingId: meta.id,
+      durationMs: meta.durationMs,
+      fps: meta.fps,
+      assets: {
+        screen: {
+          file: "screen.webm",
+          role: "master",
+          width: meta.width,
+          height: meta.height,
+          clean: true,
+          contains: ["screen"],
+          excludes: ["cursor", "webcam", "zoom", "captions", "background", "frame"],
+          use: "The only source of screen pixels. Re-render from this for any change to zoom, framing, background or transitions.",
+        },
+        camera: meta.hasCamera
+          ? {
+              file: "camera.webm",
+              role: "master",
+              width: meta.cameraWidth || null,
+              height: meta.cameraHeight || null,
+              clean: true,
+              contains: ["webcam"],
+              excludes: ["screen", "captions"],
+              use: "Recorded at the film's shape and full resolution so it holds up filling the frame, not just as a corner inset.",
+            }
+          : null,
+        pointer: {
+          file: "track.json",
+          role: "data",
+          available: !!meta.hasCursorTrack,
+          contains: ["pointer positions", "clicks", "keystroke times", "manual zoom marks"],
+          use: "Drives the drawn cursor and the automatic zoom plan. Absent for window and screen recordings, where the system cursor is already in the picture.",
+        },
+        project: {
+          file: "project.json",
+          role: "edit",
+          use: "The edit decision list: trim, style, zoom segments, camera shots, captions, output preset. This is the ONLY file to modify. Patch it and re-render.",
+        },
+        render: {
+          file: "export.webm",
+          role: "output",
+          derived: true,
+          use: "The last render. Baked and disposable — never edit or re-encode it, re-render from the masters instead.",
+        },
+      },
+      audio: {
+        inScreenTrack: !!meta.hasAudio,
+        note: "Mic and system audio are mixed into screen.webm and passed through on export without re-encoding.",
+      },
+    };
   }
 
   /* ── compositor ──────────────────────────────────────────────────────────
@@ -1214,14 +1348,27 @@
 
     paintBackground(ctx, W, H, st.background);
 
+    // Screen recordings are mostly small text, and text is what cheap
+    // resampling destroys the moment it is scaled.
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+
     const base = framedRect(W, H, srcW, srcH, st.padding);
     const cam = st.zoom.enabled && keys ? cameraAt(keys, t) : { scale: 1, x: 0.5, y: 0.5 };
+
+    // A perfectly still held frame reads as a screenshot with audio. This is a
+    // drift slow and small enough never to be noticed and always to be felt,
+    // and it is a pure function of t, so seeking stays exact.
+    const driftAmt = (st.zoom.drift == null ? 0.5 : st.zoom.drift) * (cam.scale > 1.02 ? 1 : 0);
+    const dx = Math.sin(t / 4300) * 0.0016 * driftAmt;
+    const dy = Math.cos(t / 5700) * 0.0013 * driftAmt;
 
     // The camera scales about the point of interest, expressed in the SOURCE's
     // normalised space, so a zoom target stays on the same pixel regardless of
     // how the frame happens to be letterboxed.
-    const fx = base.x + base.w * cam.x;
-    const fy = base.y + base.h * cam.y;
+    const g = guardFocus(base, cam.scale, W, H);
+    const fx = g.loX > g.hiX ? base.x + base.w / 2 : clamp(base.x + base.w * (cam.x + dx), g.loX, g.hiX);
+    const fy = g.loY > g.hiY ? base.y + base.h / 2 : clamp(base.y + base.h * (cam.y + dy), g.loY, g.hiY);
     const cx = W / 2, cy = H / 2;
 
     ctx.save();
@@ -2122,10 +2269,16 @@
     async function configureOutput(srcW, srcH) {
       const w = srcW || meta.width || 1920;
       const hgt = srcH || meta.height || 1080;
-      // Even dimensions, because encoders insist on them.
-      outW = (opts.width || Math.min(1920, w)) & ~1;
-      outH = (opts.height || Math.round((outW * hgt) / Math.max(1, w))) & ~1;
-      const bitrate = opts.bitrate || Math.round(outW * outH * fps * 0.11);
+      if (opts.width || opts.height) {
+        // Explicit pixels win — this is the path an agent or a test uses.
+        outW = (opts.width || Math.round((opts.height * w) / Math.max(1, hgt))) & ~1;
+        outH = (opts.height || Math.round((outW * hgt) / Math.max(1, w))) & ~1;
+      } else {
+        const r = resolveOutput(opts.preset || "1080p", w, hgt);
+        outW = r.width;
+        outH = r.height;
+      }
+      const bitrate = opts.bitrate || bitrateFor(outW, outH, fps, opts.quality || 0.13);
       picked = await pickVideoCodec(outW, outH, bitrate, fps);
       if (!picked) throw new Error("No supported video encoder for " + outW + "×" + outH + ".");
       canvas = new OffscreenCanvas(outW, outH);
@@ -2355,7 +2508,37 @@
    * — written by an agent that has never seen a single frame.
    */
 
-  const PROJECT_VERSION = 2;
+  const PROJECT_VERSION = 3;
+
+  /* ── output presets ──────────────────────────────────────────────────────
+   * Keyed on HEIGHT, with the width derived from the source's aspect, because
+   * a screen recording is rarely 16:9 — a 16:10 laptop trimmed to "1920 wide"
+   * is not 1080p, it is 1920x1200. Matching the height is what makes "1080p"
+   * mean the same thing here as everywhere else.
+   *
+   * `source` is the honest maximum. Anything above the source is offered but
+   * marked, because upscaling is not resolution — a 2K export of a 1280-wide
+   * capture is a stretched 1280-wide capture, at triple the file size.
+   */
+  const OUTPUT_PRESETS = [
+    { key: "720p", height: 720, label: "720p", note: "small files" },
+    { key: "1080p", height: 1080, label: "1080p", note: "the default" },
+    { key: "1440p", height: 1440, label: "2K", note: "sharp text" },
+    { key: "2160p", height: 2160, label: "4K", note: "large files" },
+    { key: "source", height: 0, label: "Source", note: "no resampling" },
+  ];
+
+  /** The real pixels a preset produces for a given source, and whether it upscales. */
+  function resolveOutput(presetKey, srcW, srcH) {
+    const p = OUTPUT_PRESETS.find((x) => x.key === presetKey) || OUTPUT_PRESETS[1];
+    const aspect = (srcW || 1920) / Math.max(1, srcH || 1080);
+    let h = p.height || srcH || 1080;
+    let w = Math.round(h * aspect);
+    // Encoders want even dimensions and nothing enormous.
+    w = clamp(w, 160, 7680) & ~1;
+    h = clamp(h, 120, 4320) & ~1;
+    return { key: p.key, label: p.label, width: w, height: h, upscales: !!srcH && h > srcH + 2 };
+  }
 
   function newProject(rec) {
     return {
@@ -2375,7 +2558,13 @@
         camShots: [],
         overlays: [],
       },
-      output: { width: Math.min(1920, rec.meta.width || 1920) },
+      // Default to the largest preset the recording can serve honestly.
+      output: {
+        preset:
+          (rec.meta.height || 0) >= 1400 ? "1440p" : (rec.meta.height || 0) >= 1040 ? "1080p" : "source",
+        fps: 0,
+        quality: 0.13,
+      },
       exports: [],
     };
   }
@@ -2396,7 +2585,8 @@
         camShots: Array.isArray(e.camShots) ? e.camShots : [],
         overlays: Array.isArray(e.overlays) ? e.overlays : [],
       },
-      output: Object.assign({}, fresh.output, p.output || {}),
+      // v2 stored a bare pixel width; presets replaced it.
+      output: Object.assign({}, fresh.output, (p.output && p.output.preset) ? p.output : {}),
       exports: Array.isArray(p.exports) ? p.exports : [],
     };
   }
@@ -2704,8 +2894,29 @@
     };
 
     /* ── 1. what to record, and what has been recorded before ── */
+    // Nobody wants to re-pick their microphone, their camera and their capture
+    // source every single time. The choices are remembered per origin.
+    const PREFS_KEY = "pinstage:studio:prefs";
+    const loadPrefs = () => {
+      try {
+        return JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") || {};
+      } catch (e) {
+        return {};
+      }
+    };
+    const savePrefs = (cfg) => {
+      try {
+        localStorage.setItem(PREFS_KEY, JSON.stringify(cfg));
+      } catch (e) {
+        /* private mode — the defaults simply come back next time */
+      }
+    };
+
     async function preflight() {
-      const cfg = { source: "tab", mic: true, camera: false, cameraDeviceId: null, systemAudio: false };
+      const cfg = Object.assign(
+        { source: "tab", mic: true, camera: false, cameraDeviceId: null, systemAudio: false },
+        loadPrefs()
+      );
 
       const sources = [
         ["tab", "This tab", "full effects"],
@@ -2715,6 +2926,7 @@
       const seg = h("div", { class: "seg" });
       const note = h("div", { class: "note" });
       const paint = () => {
+        savePrefs(cfg);
         [...seg.children].forEach((b, i) => b.classList.toggle("on", sources[i][0] === cfg.source));
         note.innerHTML =
           cfg.source === "tab"
@@ -2736,7 +2948,10 @@
       // to use.
       const camSelect = h("select", { class: "pick" }, [h("option", { value: "" }, ["Default camera"])]);
       camSelect.style.display = "none";
-      camSelect.addEventListener("change", () => (cfg.cameraDeviceId = camSelect.value || null));
+      camSelect.addEventListener("change", () => {
+        cfg.cameraDeviceId = camSelect.value || null;
+        savePrefs(cfg);
+      });
 
       let stopWatchingCameras = null;
       const fillCameras = async () => {
@@ -2752,13 +2967,18 @@
           camSelect.appendChild(h("option", { value: c.id }, [`${c.label}${tag ? " · " + tag : ""}`]));
         });
         // An iPhone that just woke up is almost always the one they meant.
+        // A remembered choice wins; otherwise an iPhone is almost always the
+        // one they meant.
+        const remembered = cams.find((c) => c.id === (keep || cfg.cameraDeviceId));
         const iphone = cams.find((c) => c.kind === "continuity");
-        camSelect.value = cams.some((c) => c.id === keep) ? keep : (iphone || cams[0]).id;
+        camSelect.value = (remembered || iphone || cams[0]).id;
         cfg.cameraDeviceId = camSelect.value;
+        savePrefs(cfg);
       };
 
-      const camRow = toggleRow("Webcam", "recorded separately, movable later", cfg.camera, async (v) => {
+      const camRow = toggleRow("Webcam", "iPhone or webcam · recorded separately", cfg.camera, async (v) => {
         cfg.camera = v;
+        savePrefs(cfg);
         camSelect.style.display = v ? "" : "none";
         if (v) {
           await fillCameras();
@@ -2773,9 +2993,9 @@
         h("h2", {}, ["Record"]),
         h("p", { class: "sub" }, ["Screen, voice and webcam. Clicks become zooms."]),
         seg,
-        toggleRow("Microphone", "your narration", cfg.mic, (v) => (cfg.mic = v)),
+        toggleRow("Microphone", "your narration", cfg.mic, (v) => { cfg.mic = v; savePrefs(cfg); }),
         camRow,
-        toggleRow("System audio", "sound from the page itself", cfg.systemAudio, (v) => (cfg.systemAudio = v)),
+        toggleRow("System audio", "sound from the page itself", cfg.systemAudio, (v) => { cfg.systemAudio = v; savePrefs(cfg); }),
         note,
       ];
       if (!store.supported)
@@ -2784,6 +3004,12 @@
       body.push(h("button", { class: "cta ghost", onclick: teardown }, ["Cancel"]));
 
       const el = sheet(body);
+      if (cfg.camera) {
+        camSelect.style.display = "";
+        fillCameras().then(() => {
+          if (!stopWatchingCameras) stopWatchingCameras = onCameraChange(fillCameras);
+        });
+      }
 
       go.addEventListener("click", async () => {
         go.disabled = true;
@@ -2905,9 +3131,14 @@
       if (session.capture.isThisTab) {
         bar.appendChild(h("span", { class: "tip" }, ["hides itself · move to the bottom edge"]));
         let hideTimer = 0;
-        const tuck = () => bar.classList.add("tuck");
+        let shown = false;
+        const tuck = () => {
+          bar.classList.add("tuck");
+          if (shown && session) { session.noteUiVisible(false); shown = false; }
+        };
         const peek = () => {
           bar.classList.remove("tuck");
+          if (!shown && session) { session.noteUiVisible(true); shown = true; }
           clearTimeout(hideTimer);
           hideTimer = setTimeout(tuck, 2600);
         };
@@ -2940,6 +3171,15 @@
         return;
       }
       const project = newProject(result);
+      // The reach for Stop puts our toolbar back on screen for the last second
+      // or two of nearly every recording. Rather than leave that for the user
+      // to spot and trim, the out point defaults to just before it — still
+      // draggable, so nothing is actually lost.
+      const runs = result.track.uiVisible || [];
+      const tail = runs[runs.length - 1];
+      if (tail && tail.from > 800 && result.meta.durationMs - tail.from < 8000) {
+        project.edit.trim.end = Math.max(800, tail.from - 180);
+      }
       project.edit.style.camera.show = result.meta.hasCamera;
       project.edit.style.cursor.show = result.meta.hasCursorTrack;
       project.edit.segments = result.meta.hasCursorTrack ? planZooms(result.track, result.meta.durationMs) : [];
@@ -2996,6 +3236,7 @@
         outH = Math.round((outW * srcH) / srcW / 2) * 2;
         canvas.width = outW; canvas.height = outH;
         rec.meta.width = srcW; rec.meta.height = srcH;
+        paintQuality();
       }, { once: true });
       video.src = URL.createObjectURL(rec.files.screen);
       const camVideo = rec.files.camera ? document.createElement("video") : null;
@@ -3064,7 +3305,7 @@
             if (which === "start") edit.trim.start = Math.min(v, edit.trim.end - 400);
             else edit.trim.end = Math.max(v, edit.trim.start + 400);
             total.textContent = formatDuration(edit.trim.end - edit.trim.start);
-            paintTrim();
+            paintTrim(); paintQuality();
             touch();
           };
           const up = () => {
@@ -3385,6 +3626,28 @@
       const nm = h("input", { class: "nm", value: project.name });
       nm.addEventListener("input", () => { project.name = nm.value; touch(); });
       const stat = h("span", { class: "stat" }, [formatDuration(dur) + " · " + formatBytes(rec.meta.bytes || 0)]);
+
+      // Quality lives next to Save, because that is when it is decided.
+      const quality = h("select", { class: "pick", title: "Export resolution" });
+      const paintQuality = () => {
+        quality.innerHTML = "";
+        OUTPUT_PRESETS.forEach((p) => {
+          const r = resolveOutput(p.key, srcW, srcH);
+          const est = (bitrateFor(r.width, r.height, rec.meta.fps || 30, project.output.quality || 0.13) *
+            ((edit.trim.end - edit.trim.start) / 1000)) / 8;
+          quality.appendChild(
+            h("option", { value: p.key }, [
+              `${r.label} · ${r.width}×${r.height}${r.upscales ? " (upscaled)" : ""} · ~${formatBytes(est)}`,
+            ])
+          );
+        });
+        quality.value = project.output.preset;
+      };
+      quality.addEventListener("change", () => {
+        project.output.preset = quality.value;
+        touch();
+        paintQuality();
+      });
       const primary = h("button", { class: "act primary" }, [o.onAttach ? "Attach to issue" : "Save video"]);
       const close = h("button", { class: "act" }, ["Close"]);
       let cancelling = false;
@@ -3413,7 +3676,8 @@
             camShots: edit.camShots,
             overlays: edit.overlays,
             trim: edit.trim,
-            width: project.output.width,
+            preset: project.output.preset,
+            quality: project.output.quality,
             shouldCancel: () => cancelling,
             onProgress: (p) => {
               bar.style.width = (p.ratio * 100).toFixed(1) + "%";
@@ -3456,7 +3720,7 @@
         h("span", { class: "mark" }, ["Studio"]),
         nm, stat,
         h("span", { class: "grow" }),
-        close, primary,
+        quality, close, primary,
       ]);
 
       const bottom = h("div", { class: "bottom" }, [
@@ -3482,7 +3746,7 @@
       wrap.appendChild(bottom); wrap.appendChild(progress);
       ui.layer.appendChild(wrap);
 
-      paintPane(); repaintMarks(); paintTrack(); paintCamShots(); paintCaptions(); paintTrim();
+      paintPane(); repaintMarks(); paintTrack(); paintCamShots(); paintCaptions(); paintTrim(); paintQuality();
       video.addEventListener("loadeddata", () => { seekTo(edit.trim.start); draw(); }, { once: true });
 
       // An agent editing the project from MCP lands here.
@@ -3520,6 +3784,7 @@
     startSession,
     listCameras,
     onCameraChange,
+    buildManifest,
     classifyCamera,
     renderFrame,
     cameraLayoutAt,
@@ -3535,6 +3800,9 @@
     demuxWebM,
     packetStream,
     exportRecording,
+    OUTPUT_PRESETS,
+    resolveOutput,
+    bitrateFor,
     newProject,
     migrateProject,
     saveProject,
