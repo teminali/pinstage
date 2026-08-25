@@ -1,1 +1,5 @@
 .vercel
+remotion/node_modules
+remotion/public
+remotion/.props.json
+remotion/out

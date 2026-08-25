@@ -128,6 +128,7 @@
    * fetched from beside it, so a CDN copy and a self-hosted copy both work with
    * no configuration. */
   const SELF_URL = (document.currentScript && document.currentScript.src) || "";
+  const VERSION = "0.6.0";
   let STUDIO_URL = "";
   let studioPromise = null;
 
@@ -786,6 +787,23 @@
     // Optional override for hosts that serve the two files from different
     // places; by default Studio is found next to this script.
     STUDIO_URL = (cfg && cfg.studioUrl) || "";
+
+    // Say which build this is and where it came from.
+    //
+    // The toolbar is normally served from a CDN so every host picks up new
+    // versions with no deploy — but each host also keeps a local copy as an
+    // onerror fallback, and that copy goes stale the moment nobody remembers
+    // to update it. When the CDN request fails for any reason the fallback
+    // loads silently, and the symptom is "a feature is missing on one of my
+    // apps" with nothing anywhere to explain it. One line in the console turns
+    // that into a five-second diagnosis.
+    const from = SELF_URL || "(inline)";
+    const local = !/^https?:\/\//.test(from) || /localhost|127\.0\.0\.1/.test(from);
+    console.info(
+      "%c[pinstage]%c v" + VERSION + " · " + from + (local ? "  ← local fallback copy, may be older than the CDN" : ""),
+      "color:#f59e0b;font-weight:700",
+      "color:inherit"
+    );
     // Back-compat / convenience: allow passing supabase config directly.
     if (!cfg?.adapter && cfg?.supabaseUrl) {
       cfg.adapter = supabaseAdapter({ url: cfg.supabaseUrl, anonKey: cfg.supabaseAnonKey, getToken: cfg.getToken });
@@ -2639,7 +2657,9 @@
       }
       const bar = document.createElement("div");
       bar.className = "bar";
-      bar.innerHTML = `<span class="brand" title="Pinstage">${logo(15)}<span class="env">${esc(cfg.environmentLabel || "Staging")}</span></span>`;
+      bar.innerHTML =
+        `<span class="brand" title="Pinstage v${VERSION}\n${esc(SELF_URL || "inline")}">` +
+        `${logo(15)}<span class="env">${esc(cfg.environmentLabel || "Staging")}</span></span>`;
 
       const comment = document.createElement("button");
       comment.className = state.mode === "comment" ? "active" : "";
@@ -2783,5 +2803,5 @@
     })();
   }
 
-  window.Pinstage = { init, supabaseAdapter };
+  window.Pinstage = { init, supabaseAdapter, version: VERSION, source: SELF_URL };
 })();
