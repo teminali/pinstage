@@ -2992,6 +2992,207 @@
     return { meta, track, files: { screen, camera } };
   }
 
+  /* ── disk sync ────────────────────────────────────────────────────────────
+   * The agent that edits these recordings runs on the SAME machine as the
+   * browser that made them. Routing gigabytes of video up to storage and back
+   * down again to bridge a gap of zero millimetres would be absurd, so Studio
+   * writes into a real folder instead — by default the one the user is told to
+   * pick, ~/Documents/pinstage/recordings — and the agent simply reads it.
+   *
+   * The browser cannot choose that folder on its own; the user grants it once
+   * through the directory picker. The handle is kept in IndexedDB (a directory
+   * handle is a live object, not something JSON can hold) so the grant survives
+   * reloads and never has to be given twice.
+   *
+   * What lands on disk per recording:
+   *
+   *   <slug>/screen.webm      the master, no cursor, no webcam, no effects
+   *   <slug>/camera.webm      the webcam master, if there was one
+   *   <slug>/track.json       pointer, clicks, keystroke times
+   *   <slug>/project.json     THE EDIT — the only file an agent should change
+   *   <slug>/manifest.json    what each asset is and when to use it
+   *   <slug>/export.webm      the last render, disposable
+   */
+
+  const DISK_DB = "pinstage-studio";
+  const DISK_STORE = "handles";
+  const DISK_KEY = "recordings-dir";
+
+  function idb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DISK_DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(DISK_STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbGet(key) {
+    const db = await idb();
+    return new Promise((resolve) => {
+      const tx = db.transaction(DISK_STORE, "readonly").objectStore(DISK_STORE).get(key);
+      tx.onsuccess = () => resolve(tx.result || null);
+      tx.onerror = () => resolve(null);
+    });
+  }
+
+  async function idbPut(key, value) {
+    const db = await idb();
+    return new Promise((resolve) => {
+      const tx = db.transaction(DISK_STORE, "readwrite").objectStore(DISK_STORE).put(value, key);
+      tx.onsuccess = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
+  }
+
+  const disk = {
+    supported: typeof window !== "undefined" && !!window.showDirectoryPicker,
+
+    /** The folder the user granted, if the grant is still good. */
+    async handle(promptIfNeeded) {
+      if (!this.supported) return null;
+      let h = await idbGet(DISK_KEY);
+      if (h) {
+        // A grant can lapse — the browser restarted, the folder moved. Asking
+        // is cheap; failing silently on write is not.
+        const perm = await h.queryPermission({ mode: "readwrite" }).catch(() => "denied");
+        if (perm === "granted") return h;
+        if (promptIfNeeded) {
+          const asked = await h.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+          if (asked === "granted") return h;
+        }
+        return null;
+      }
+      if (!promptIfNeeded) return null;
+      h = await window.showDirectoryPicker({ id: "pinstage-recordings", mode: "readwrite", startIn: "documents" });
+      if (!h) return null;
+      await idbPut(DISK_KEY, h);
+      return h;
+    },
+
+    async forget() {
+      await idbPut(DISK_KEY, null);
+    },
+
+    /** A folder name a human can read and a shell will not fight. */
+    slug(project) {
+      const base = (project.name || "recording")
+        .toLowerCase()
+        .replace(/[^\w\s-]+/g, "")
+        .trim()
+        .replace(/\s+/g, "-")
+        .slice(0, 48) || "recording";
+      return base + "-" + String(project.id).slice(0, 8);
+    },
+
+    async writeFile(dir, name, blobOrText) {
+      const fh = await dir.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(blobOrText instanceof Blob ? blobOrText : new Blob([blobOrText]));
+      await w.close();
+    },
+
+    /**
+     * Put a recording and its edit on disk. Media is only copied when it is
+     * missing or has changed size — a three gigabyte master should not be
+     * rewritten because someone nudged a slider.
+     */
+    async sync(rec, project, onStep) {
+      const root = await this.handle(true);
+      if (!root) throw new Error("No folder chosen, so there is nowhere to write.");
+      const dir = await root.getDirectoryHandle(this.slug(project), { create: true });
+
+      const copyIfNeeded = async (name, file) => {
+        if (!file) return false;
+        try {
+          const existing = await (await dir.getFileHandle(name)).getFile();
+          if (existing.size === file.size) return false;
+        } catch (e) {
+          /* not there yet */
+        }
+        if (onStep) onStep("Copying " + name + " (" + formatBytes(file.size) + ")");
+        await this.writeFile(dir, name, file);
+        return true;
+      };
+
+      await copyIfNeeded("screen.webm", rec.files.screen);
+      await copyIfNeeded("camera.webm", rec.files.camera);
+
+      if (onStep) onStep("Writing the edit");
+      await this.writeFile(dir, "track.json", JSON.stringify(rec.track));
+      await this.writeFile(dir, "manifest.json", JSON.stringify(buildManifest(rec.meta), null, 2));
+      await this.writeFile(dir, "project.json", JSON.stringify(project, null, 2));
+      // A plain-language pointer, so the folder explains itself to whoever
+      // opens it next — human or agent.
+      await this.writeFile(dir, "README.md", readmeFor(project, rec.meta, this.slug(project)));
+
+      project.disk = { folder: this.slug(project), syncedAt: Date.now() };
+      await saveProject(project);
+      if (onStep) onStep("Synced");
+      return this.slug(project);
+    },
+
+    /** Copy a finished render next to its sources. */
+    async putExport(project, file) {
+      const root = await this.handle(false);
+      if (!root || !project.disk) return null;
+      const dir = await root.getDirectoryHandle(project.disk.folder, { create: true });
+      await this.writeFile(dir, "export.webm", file);
+      return project.disk.folder;
+    },
+
+    /**
+     * Read back the edit an agent may have rewritten. Compared by content
+     * rather than by modification time, because a filesystem timestamp is a
+     * poor witness across a browser sandbox.
+     */
+    async readProject(project) {
+      const root = await this.handle(false);
+      if (!root || !project.disk) return null;
+      try {
+        const dir = await root.getDirectoryHandle(project.disk.folder);
+        const f = await (await dir.getFileHandle("project.json")).getFile();
+        return JSON.parse(await f.text());
+      } catch (e) {
+        return null;
+      }
+    },
+  };
+
+  function readmeFor(project, meta, slug) {
+    return `# ${project.name}
+
+Recorded with Pinstage Studio on ${new Date(meta.startedAt).toLocaleString()}.
+${formatDuration(meta.durationMs)} · ${meta.width}×${meta.height} · ${Math.round(meta.fps)}fps
+
+## The files
+
+| file | what it is |
+| --- | --- |
+| \`screen.webm\` | **Master.** The screen and only the screen — no cursor, no webcam, no zoom, no captions, no background. Every effect is applied at render time, so editing never compounds onto an already-processed picture. |
+${meta.hasCamera ? "| `camera.webm` | **Master.** The webcam, recorded at the film's shape and full resolution so it holds up filling the frame. |\n" : ""}| \`track.json\` | Pointer positions, clicks and keystroke times. Drives the drawn cursor and the automatic zoom plan. |
+| \`project.json\` | **The edit.** Trim, clips, zooms, camera shots, captions, output settings. This is the only file to change. |
+| \`manifest.json\` | What each asset is and when to use it, in machine-readable form. |
+| \`export.webm\` | The last render. Baked and disposable — never edit it, re-render instead. |
+
+## Editing this
+
+Change \`project.json\` and re-render. Nothing else should be touched: the
+masters are the only copies, and they are what makes an edit reversible.
+
+Times inside \`project.json\` are **source** milliseconds — where a moment sits
+in the original recording — for everything except \`clips[].srcStart/srcEnd\`,
+which are also source times but define what survives into the finished film and
+in what order.
+
+The Pinstage MCP server exposes this folder as tools; \`pinstage_studio_*\` will
+list, read, patch and render it. The Remotion project in the pinstage repo
+renders the same \`project.json\` if you want the full compositing toolkit.
+
+Folder: \`${slug}\`
+`;
+  }
+
   /* ── UI ──────────────────────────────────────────────────────────────────
    * One shadow root, so the host application's CSS cannot reach in and this
    * cannot reach out. That matters more here than anywhere else in the toolbar:
@@ -3669,9 +3870,28 @@
 
       /* ── autosave ── */
       let saveTimer = 0;
+      // What we last wrote to disk. The poll below compares against this so
+      // our own writes are not mistaken for an agent's edits.
+      let diskEcho = null;
+      const pushToDisk = async () => {
+        if (!project.disk) return;
+        try {
+          const root = await disk.handle(false);
+          if (!root) return;
+          const dir = await root.getDirectoryHandle(project.disk.folder, { create: true });
+          const text = JSON.stringify(project, null, 2);
+          await disk.writeFile(dir, "project.json", text);
+          diskEcho = text;
+        } catch (e) {
+          /* the grant lapsed or the folder moved; the next sync will say so */
+        }
+      };
       const touch = () => {
         clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => saveProject(project).catch(() => {}), 400);
+        saveTimer = setTimeout(() => {
+          saveProject(project).catch(() => {});
+          pushToDisk();
+        }, 400);
       };
       const recompute = () => {
         tl = buildTimeline(edit.clips, dur);
@@ -4175,6 +4395,10 @@
           if (!out) return teardown();
           project.exports.unshift({ at: Date.now(), bytes: out.meta.bytes, width: out.meta.width, height: out.meta.height, frames: out.meta.frames });
           await saveProject(project);
+          // If this recording lives in a folder, the render belongs next to
+          // the masters that produced it — that is where the agent looks.
+          const landed = await disk.putExport(project, out.file).catch(() => null);
+          if (landed) flash("Saved into " + landed);
           stat.textContent = formatBytes(out.meta.bytes) + " · " + out.meta.frames + " frames";
           if (o.onAttach) { await o.onAttach(out.file, out.meta); teardown(); }
           else {
@@ -4281,8 +4505,28 @@
         toolbar,
         h("div", { class: "tbody" }, [laneHeads, h("div", { class: "lanewrap" }, [ruler, lanes])]),
       ]));
+      const syncBtn = h("button", { class: "tool" }, [project.disk ? "◆ " + project.disk.folder : "◆ Sync to a folder"]);
+      const syncNote = h("span", { class: "foothint" }, [""]);
+      if (!disk.supported) {
+        syncBtn.disabled = true;
+        syncBtn.title = "This browser cannot write to a folder (Chrome or Edge can).";
+      }
+      syncBtn.addEventListener("click", async () => {
+        syncBtn.disabled = true;
+        try {
+          const folder = await disk.sync(rec, project, (m) => (syncNote.textContent = m));
+          diskEcho = JSON.stringify(project, null, 2);
+          syncBtn.textContent = "◆ " + folder;
+          syncNote.textContent = "Agents can edit project.json in that folder — changes appear here.";
+        } catch (e) {
+          syncNote.textContent = String((e && e.message) || e);
+        } finally {
+          syncBtn.disabled = false;
+        }
+      });
+
       wrap.appendChild(h("div", { class: "footer" }, [
-        undoBtn, redoBtn, h("span", { class: "grow" }),
+        undoBtn, redoBtn, syncBtn, syncNote, h("span", { class: "grow" }),
         h("span", { class: "foothint" }, ["Space to play · S to split · ⌘Z to undo"]),
       ]));
       wrap.appendChild(progress);
@@ -4317,6 +4561,33 @@
           } catch (e) { /* tainted canvas just means no thumbnail */ }
         }, 700);
       }, { once: true });
+
+      /* An agent rewriting project.json on disk shows up here within a few
+       * seconds. Compared by content rather than modification time, because a
+       * filesystem timestamp is a poor witness across a browser sandbox — and
+       * compared against what WE last wrote, so our own saves do not look like
+       * somebody else's edit. */
+      const diskPoll = setInterval(async () => {
+        if (!project.disk) return;
+        const fresh = await disk.readProject(project).catch(() => null);
+        if (!fresh) return;
+        const text = JSON.stringify(fresh, null, 2);
+        if (text === diskEcho) return;
+        diskEcho = text;
+        const m = migrateProject(fresh, rec);
+        project.edit = m.edit;
+        project.name = m.name || project.name;
+        project.output = m.output || project.output;
+        nm.value = project.name;
+        Object.assign(style, m.edit.style);
+        edit.clips = m.edit.clips; edit.segments = m.edit.segments;
+        edit.camShots = m.edit.camShots; edit.overlays = m.edit.overlays;
+        recompute(); paintPane();
+        flash("Edit updated from disk");
+        await saveProject(project).catch(() => {});
+      }, 2500);
+      const stopPoll = () => clearInterval(diskPoll);
+      back.addEventListener("click", stopPoll);
 
       // An agent editing the project through MCP lands here.
       addEventListener("pinstage:project-external", (e) => {
@@ -4380,6 +4651,7 @@
     loadProject,
     listRecordings,
     openRecording,
+    disk,
     PROJECT_VERSION,
     open,
     pickVideoCodec,
