@@ -217,12 +217,12 @@
   /* ── inline SVG icon set (stroke style, currentColor) ───────────────────── */
 
   const I = {
-    comment: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+    comment: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v6"/><path d="M9 10h6"/>',
     inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
     minus: '<path d="M5 12h14"/>',
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
-    video: '<rect x="2" y="6" width="13" height="12" rx="2"/><path d="M15 10.5 22 7v10l-7-3.5z"/>',
+    video: '<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/>',
     image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
     undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/>',
     crop: '<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>',
@@ -1090,9 +1090,23 @@
         box-shadow: 0 8px 30px rgba(0,0,0,.35); pointer-events: auto; }
       .bar .brand { display: flex; align-items: center; gap: 6px; padding: 0 10px; border-right: 1px solid #2a2c33; color: #fbbf24; }
       .bar .brand .env { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-      .bar > button { height: 32px; padding: 0 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; color: #b6b8bf; justify-content: center; }
+      /* Icon only. A label would say what the icon already says, and the bar is
+         on screen over someone else's application - it should take the least
+         room that still reads. The tooltip carries the name. */
+      .bar > button { position: relative; height: 32px; min-width: 34px; padding: 0 8px; border-radius: 999px;
+        font-size: 12.5px; font-weight: 600; color: #b6b8bf; justify-content: center; gap: 5px; }
       .bar > button:hover { background: #1c1e24; color: #fff; }
       .bar > button.active { background: #f59e0b; color: #16130a; }
+      .bar > button[data-tip]::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 10px);
+        left: 50%; transform: translateX(-50%) translateY(3px); background: #16181e; color: #e7e8ea;
+        border: 1px solid #2a2c33; padding: 5px 9px; border-radius: 8px; font-size: 11.5px; font-weight: 600;
+        letter-spacing: -0.01em; white-space: nowrap; pointer-events: none; opacity: 0;
+        box-shadow: 0 8px 24px rgba(0,0,0,.45); transition: opacity .13s ease, transform .13s ease; }
+      .bar > button[data-tip]::before { content: ""; position: absolute; bottom: calc(100% + 5px); left: 50%;
+        transform: translateX(-50%) translateY(3px); border: 5px solid transparent; border-top-color: #2a2c33;
+        pointer-events: none; opacity: 0; transition: opacity .13s ease, transform .13s ease; }
+      .bar > button[data-tip]:hover::after, .bar > button[data-tip]:hover::before {
+        opacity: 1; transform: translateX(-50%) translateY(0); }
       .bar .badge { min-width: 17px; height: 17px; padding: 0 4px; border-radius: 999px; background: #f59e0b;
         color: #16130a; font-size: 10px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; transition: all .2s; }
       .bar .badge.has-timer {
@@ -2626,18 +2640,20 @@
 
       const comment = document.createElement("button");
       comment.className = state.mode === "comment" ? "active" : "";
-      comment.innerHTML = svg("comment", 14) + `<span>${state.mode === "comment" ? "Click the page…" : "Comment"}</span>`;
+      comment.innerHTML = svg("comment", 15);
+      comment.setAttribute("data-tip", state.mode === "comment" ? "Click the page…" : "Comment");
       comment.addEventListener("click", () => setMode(state.mode === "comment" ? "idle" : "comment"));
       bar.appendChild(comment);
 
       const record = document.createElement("button");
-      record.innerHTML = svg("video", 14) + "<span>Record</span>";
+      record.innerHTML = svg("video", 15);
+      record.setAttribute("data-tip", "Record");
       record.title = "Record a tutorial — screen, voice and webcam, with click-driven zoom";
       record.addEventListener("click", async () => {
         try {
           (await loadStudio()).open({});
         } catch (e) {
-          record.innerHTML = svg("video", 14) + "<span>Unavailable</span>";
+          record.setAttribute("data-tip", "Recorder unavailable");
           record.title = String((e && e.message) || e);
         }
       });
@@ -2679,7 +2695,8 @@
       }
 
       const inbox = document.createElement("button");
-      inbox.innerHTML = svg("inbox", 14) + `<span>Issues</span>${badgeHTML}`;
+      inbox.innerHTML = svg("inbox", 15) + badgeHTML;
+      inbox.setAttribute("data-tip", "Issues");
       inbox.title = "All reported issues";
       inbox.addEventListener("click", () => {
         state.inboxOpen = !state.inboxOpen;
@@ -2689,7 +2706,8 @@
       bar.appendChild(inbox);
 
       const hide = document.createElement("button");
-      hide.innerHTML = svg("minus", 14);
+      hide.innerHTML = svg("minus", 15);
+      hide.setAttribute("data-tip", "Hide");
       hide.title = "Hide toolbar";
       hide.addEventListener("click", () => setHidden(true));
       bar.appendChild(hide);

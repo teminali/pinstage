@@ -1435,7 +1435,13 @@
    * `onPacket` receives the ORIGINAL encoded bytes — video goes to a decoder,
    * audio goes straight into the output file untouched.
    */
-  async function demuxWebM(file, onPacket, onProgress) {
+  async function demuxWebM(file, onPacket, hooks) {
+    const onProgress = hooks && hooks.onProgress;
+    // Tracks are known a few hundred bytes in, but the return value only
+    // arrives when the whole file has been walked. A caller that needs the
+    // codec and the picture size BEFORE it starts decoding — which is every
+    // caller — has to be told as soon as they are parsed.
+    const onTracks = hooks && hooks.onTracks;
     const r = FileReader_(file);
     let timecodeScale = 1e6;
     let clusterTimeMs = 0;
@@ -1542,6 +1548,7 @@
       }
       if (id === EL.Tracks) {
         await parseTracks(r.pos + size);
+        if (onTracks) onTracks({ tracks, videoTrack, audioTrack, timecodeScale });
         continue;
       }
       if (id === EL.Cluster) {
@@ -1623,12 +1630,19 @@
         else waitingWriter = resolve;
       });
 
-    demuxWebM(file, async (p) => {
-      if (filter && !filter(p)) return;
-      // The packet's bytes are a view into the reader's buffer, which is about
-      // to be reused — copy before it is handed across the queue.
-      await push({ kind: p.kind, timeMs: p.timeMs, keyframe: p.keyframe, data: p.data.slice() });
-    })
+    demuxWebM(
+      file,
+      async (p) => {
+        if (filter && !filter(p)) return;
+        // The packet's bytes are a view into the reader's buffer, which is about
+        // to be reused — copy before it is handed across the queue.
+        await push({ kind: p.kind, timeMs: p.timeMs, keyframe: p.keyframe, data: p.data.slice() });
+      },
+      // Published the moment the Tracks element is parsed, which is well before
+      // the first packet is consumed — so `info` is available to whoever
+      // configures the decoder.
+      { onTracks: (i) => (info = i) }
+    )
       .then((i) => {
         info = i;
       })
@@ -1786,22 +1800,17 @@
     }
 
     const st = Object.assign({}, STYLE_DEFAULTS, style || {});
-    // Even dimensions, because encoders insist. Height follows the source's
-    // aspect unless it is given explicitly — defaulting it to 1080 would squash
-    // every recording that is not already 16:9.
-    const outW = (opts.width || Math.min(1920, meta.width) || 1920) & ~1;
-    const outH =
-      (opts.height || Math.round((outW * meta.height) / Math.max(1, meta.width))) & ~1;
     const fps = opts.fps || Math.min(60, Math.round(meta.fps || 30));
-    const bitrate = opts.bitrate || Math.round(outW * outH * fps * 0.11);
 
-    const picked = await pickVideoCodec(outW, outH, bitrate, fps);
-    if (!picked) throw new Error("No supported video encoder for " + outW + "×" + outH + ".");
+    // Output dimensions are NOT settled here. `meta` came from getSettings() at
+    // the instant the stream arrived — before a frame existed — and a tab
+    // resized mid-recording moves it again. The container's own Tracks element
+    // is the truth about the picture's shape, and it is read a few lines into
+    // the demux, so the encoder is configured there instead of here. Guessing
+    // now is what turns circles into ellipses.
+    let outW = 0, outH = 0, picked = null, canvas = null, ctx = null, encoder = null;
 
     const keys = st.zoom.enabled ? buildCameraTrack(segments || []) : null;
-    const canvas = new OffscreenCanvas(outW, outH);
-    const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
-
     const camera = cameraFile ? await CameraFeeder(cameraFile).catch(() => null) : null;
 
     const writerId = meta.id;
@@ -1811,17 +1820,30 @@
     let audioReady = false;
     const pendingAudio = [];
 
-    const encoder = new VideoEncoder({
-      output: (chunk) => {
-        const buf = new Uint8Array(chunk.byteLength);
-        chunk.copyTo(buf);
-        muxer.addVideo(chunk.timestamp / 1000, chunk.type === "key", buf);
-      },
-      error: (e) => {
-        throw e;
-      },
-    });
-    encoder.configure(picked.config);
+    /** Size the output from the real source shape, then build the encoder. */
+    async function configureOutput(srcW, srcH) {
+      const w = srcW || meta.width || 1920;
+      const hgt = srcH || meta.height || 1080;
+      // Even dimensions, because encoders insist on them.
+      outW = (opts.width || Math.min(1920, w)) & ~1;
+      outH = (opts.height || Math.round((outW * hgt) / Math.max(1, w))) & ~1;
+      const bitrate = opts.bitrate || Math.round(outW * outH * fps * 0.11);
+      picked = await pickVideoCodec(outW, outH, bitrate, fps);
+      if (!picked) throw new Error("No supported video encoder for " + outW + "×" + outH + ".");
+      canvas = new OffscreenCanvas(outW, outH);
+      ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+      encoder = new VideoEncoder({
+        output: (chunk) => {
+          const buf = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buf);
+          muxer.addVideo(chunk.timestamp / 1000, chunk.type === "key", buf);
+        },
+        error: (e) => {
+          throw e;
+        },
+      });
+      encoder.configure(picked.config);
+    }
 
     const started = performance.now();
     let framesIn = 0;
@@ -1892,6 +1914,7 @@
       if (!configured) {
         const vt = stream.info && stream.info.videoTrack;
         const at = stream.info && stream.info.audioTrack;
+        await configureOutput((vt && vt.width) || meta.width, (vt && vt.height) || meta.height);
         decoder.configure({
           codec: (vt && vt.codecId) === "V_VP8" ? "vp8" : "vp09.00.10.08",
           codedWidth: (vt && vt.width) || meta.width,
@@ -1933,7 +1956,7 @@
 
       // Backpressure: let the decoder and encoder catch up rather than queueing
       // the whole file into them.
-      while (decoder.decodeQueueSize > 12 || encoder.encodeQueueSize > 12) {
+      while (decoder.decodeQueueSize > 12 || (encoder && encoder.encodeQueueSize > 12)) {
         await new Promise((r) => setTimeout(r, 4));
       }
       await flushSink();
@@ -1956,9 +1979,9 @@
     }
 
     await decoder.flush().catch(() => {});
-    await encoder.flush().catch(() => {});
+    if (encoder) await encoder.flush().catch(() => {});
     decoder.close();
-    encoder.close();
+    if (encoder) encoder.close();
     if (camera) camera.close();
 
     if (cancelled) {
@@ -2371,13 +2394,37 @@
       const wrap = h("div", { class: "studio" });
       const stage = h("div", { class: "stage" });
       const canvas = h("canvas");
-      const outW = 1600, outH = Math.round((outW * rec.meta.height) / rec.meta.width / 2) * 2;
+      // The capture's reported settings and the picture the encoder actually
+      // produced can disagree — getSettings() is read the instant the stream
+      // arrives, before a single frame exists, and a tab that is resized mid
+      // recording moves it again. Trusting it stretches the preview: circles
+      // come out as ellipses. So these are provisional, and the decoded video
+      // overrides them the moment it can.
+      let srcW = rec.meta.width, srcH = rec.meta.height;
+      const outW = 1600;
+      let outH = Math.round((outW * srcH) / Math.max(1, srcW) / 2) * 2;
       canvas.width = outW; canvas.height = outH;
       const ctx = canvas.getContext("2d", { alpha: false });
       stage.appendChild(canvas);
 
       const video = document.createElement("video");
       video.muted = true; video.playsInline = true; video.preload = "auto";
+      video.addEventListener(
+        "loadedmetadata",
+        () => {
+          if (!video.videoWidth || !video.videoHeight) return;
+          srcW = video.videoWidth;
+          srcH = video.videoHeight;
+          outH = Math.round((outW * srcH) / srcW / 2) * 2;
+          canvas.width = outW;
+          canvas.height = outH;
+          // Correct the record too, so the export renders the same shape the
+          // preview just showed.
+          rec.meta.width = srcW;
+          rec.meta.height = srcH;
+        },
+        { once: true }
+      );
       video.src = URL.createObjectURL(rec.files.screen);
       const camVideo = rec.files.camera ? document.createElement("video") : null;
       if (camVideo) { camVideo.muted = true; camVideo.playsInline = true; camVideo.src = URL.createObjectURL(rec.files.camera); }
@@ -2392,7 +2439,7 @@
       const draw = () => {
         const t = video.currentTime * 1000;
         renderFrame(ctx, {
-          W: outW, H: outH, src: video, srcW: rec.meta.width, srcH: rec.meta.height,
+          W: outW, H: outH, src: video, srcW, srcH,
           t, style, keys, track: rec.track, cameraSrc: camVideo,
         });
         playhead.style.left = (t / rec.meta.durationMs) * 100 + "%";
