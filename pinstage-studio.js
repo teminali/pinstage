@@ -638,22 +638,44 @@
     const isThisTab = surface === "browser" && o.source === "tab";
 
     let camera = null;
+    let cameraSettings = null;
     if (o.camera) {
-      const want = { width: { ideal: 1280 }, height: { ideal: 720 } };
+      // The webcam is not a thumbnail. Cutting to it full screen while someone
+      // talks for thirty seconds is the whole reason it is recorded separately,
+      // and you cannot do that convincingly with a 1280x720 crop of a portrait
+      // sensor letterboxed into a 4K landscape film. So it is asked for at the
+      // FILM's shape and the highest resolution the device will give: 1080p
+      // landscape for a wide recording, 1080x1920 for a vertical one.
+      const portrait = (settings.height || innerHeight) > (settings.width || innerWidth);
+      const want = portrait
+        ? { width: { ideal: 1080 }, height: { ideal: 1920 }, aspectRatio: { ideal: 9 / 16 } }
+        : { width: { ideal: 1920 }, height: { ideal: 1080 }, aspectRatio: { ideal: 16 / 9 } };
       if (o.cameraDeviceId) want.deviceId = { exact: o.cameraDeviceId };
       else want.facingMode = "user";
       try {
         camera = await navigator.mediaDevices.getUserMedia({ video: want, audio: false });
       } catch (e) {
-        // The chosen camera can vanish between picking it and starting — an
-        // iPhone that locked, a USB cam unplugged. Fall back to any camera
-        // rather than lose the whole recording over the webcam.
+        // Not every camera can do the asked-for shape. Drop the aspect and the
+        // resolution before dropping the camera.
         try {
-          camera = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        } catch (e2) {
+          const relaxed = { ...want };
+          delete relaxed.aspectRatio;
+          relaxed.width = { ideal: portrait ? 720 : 1280 };
+          relaxed.height = { ideal: portrait ? 1280 : 720 };
+          camera = await navigator.mediaDevices.getUserMedia({ video: relaxed, audio: false });
+        } catch (e1) {
           camera = null;
         }
       }
+      if (!camera) try {
+        // The chosen camera can vanish between picking it and starting — an
+        // iPhone that locked, a USB cam unplugged. Fall back to any camera
+        // rather than lose the whole recording over the webcam.
+        camera = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      } catch (e2) {
+        camera = null;
+      }
+      if (camera) cameraSettings = camera.getVideoTracks()[0].getSettings();
     }
 
     let mic = null;
@@ -691,6 +713,8 @@
       canDrawCursor: isThisTab,
       hasAudio: !!mixedAudio,
       hasCamera: !!camera,
+      cameraWidth: (cameraSettings && cameraSettings.width) || 0,
+      cameraHeight: (cameraSettings && cameraSettings.height) || 0,
       width: settings.width || innerWidth,
       height: settings.height || innerHeight,
       fps: settings.frameRate || o.fps,
@@ -853,6 +877,8 @@
           surface: cap.surface,
           hasCursorTrack: !!track,
           hasCamera: !!cameraRec,
+          cameraWidth: cap.cameraWidth,
+          cameraHeight: cap.cameraHeight,
           hasAudio: cap.hasAudio,
           bytes: session.bytes,
           droppedChunks: screen.dropped + (cameraRec ? cameraRec.dropped : 0),
@@ -929,7 +955,9 @@
   }
 
   function roundRectPath(ctx, x, y, w, h, r) {
-    const rr = Math.min(r, w / 2, h / 2);
+    // Never negative: canvas throws IndexSizeError rather than clamping, and
+    // every caller that interpolates a radius can overshoot past its target.
+    const rr = Math.max(0, Math.min(r, w / 2, h / 2));
     ctx.beginPath();
     ctx.moveTo(x + rr, y);
     ctx.arcTo(x + w, y, x + w, y + h, rr);
@@ -977,6 +1005,202 @@
     ctx.stroke();
     ctx.fillStyle = "#fff";
     ctx.fill();
+    ctx.restore();
+  }
+
+  /* ── camera shots ────────────────────────────────────────────────────────
+   * The webcam spends most of a tutorial as a small circle in a corner. But
+   * when someone stops driving the UI and just talks for half a minute, the
+   * screen is dead weight and the face is the content — so the camera comes
+   * forward and fills the frame.
+   *
+   * That is a MOVE, not a cut: the corner circle grows into the full frame and
+   * shrinks back, on the same eased curves the zoom camera uses. Cutting hard
+   * between the two reads as a mistake.
+   */
+  const CAMERA_SHOT_DEFAULTS = { inMs: 560, outMs: 480, mode: "full" };
+
+  /** Where the webcam sits at time t, in output pixels. */
+  function cameraLayoutAt(shots, t, W, H, st) {
+    const d = Math.min(W, H) * st.camera.size;
+    const boxH = st.camera.shape === "circle" ? d : d * 0.66;
+    const margin = Math.min(W, H) * 0.03;
+    const pip = {
+      x: margin + (W - d - margin * 2) * st.camera.x,
+      y: margin + (H - boxH - margin * 2) * st.camera.y,
+      w: d,
+      h: boxH,
+      radius: st.camera.shape === "circle" ? d / 2 : d * 0.09,
+      k: 0,
+    };
+    if (!shots || !shots.length) return pip;
+
+    // The last shot that touches t wins, so hand-placed overlaps behave the
+    // way the timeline shows them.
+    let k = 0;
+    for (const sh of shots) {
+      const inMs = sh.inMs == null ? CAMERA_SHOT_DEFAULTS.inMs : sh.inMs;
+      const outMs = sh.outMs == null ? CAMERA_SHOT_DEFAULTS.outMs : sh.outMs;
+      if (t < sh.start || t > sh.end + outMs) continue;
+      if (t < sh.start + inMs) k = ease.settle(clamp((t - sh.start) / inMs, 0, 1));
+      else if (t <= sh.end) k = 1;
+      else k = 1 - ease.out(clamp((t - sh.end) / outMs, 0, 1));
+    }
+    if (k <= 0) return pip;
+    // `settle` deliberately overshoots past 1 — that overshoot is what makes
+    // the face arrive rather than merely resize. The geometry can absorb it;
+    // the radius cannot, so it is clamped rather than the curve being softened.
+    return {
+      x: lerp(pip.x, 0, k),
+      y: lerp(pip.y, 0, k),
+      w: lerp(pip.w, W, k),
+      h: lerp(pip.h, H, k),
+      radius: Math.max(0, lerp(pip.radius, 0, k)),
+      k: clamp(k, 0, 1),
+    };
+  }
+
+  /* ── captions ────────────────────────────────────────────────────────────
+   * Drawn last and outside every transform, because a caption that zooms with
+   * the picture is unreadable at exactly the moment it matters.
+   *
+   * Inter is asked for first and the platform UI face is the fallback. Canvas
+   * cannot load a font on its own, so if the host page has Inter (most design
+   * systems do) it is used; otherwise the stack lands on San Francisco or Segoe,
+   * which are close enough that the layout does not move. Nothing is fetched
+   * from a third party — this stays a zero-dependency file.
+   */
+  const CAPTION_FONT = '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif';
+  const CAPTION_MONO = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+
+  const CAPTION_STYLES = {
+    clean: { label: "Clean", hint: "Inter, quiet scrim" },
+    bold: { label: "Bold", hint: "heavy, outlined" },
+    pop: { label: "Pop", hint: "word chips, accent" },
+    neon: { label: "Neon", hint: "glow" },
+    terminal: { label: "Terminal", hint: "mono on a bar" },
+  };
+
+  /** Greedy wrap against a real measured width — no character-count guessing. */
+  function wrapText(ctx, text, maxWidth) {
+    const words = String(text || "").split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = "";
+    for (const w of words) {
+      const next = line ? line + " " + w : w;
+      if (ctx.measureText(next).width > maxWidth && line) {
+        lines.push(line);
+        line = w;
+      } else line = next;
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+
+  function drawCaption(ctx, W, H, cap, t) {
+    const IN = 160, OUT = 200;
+    let alpha = 1;
+    if (t < cap.start + IN) alpha = clamp((t - cap.start) / IN, 0, 1);
+    else if (t > cap.end - OUT) alpha = clamp((cap.end - t) / OUT, 0, 1);
+    if (alpha <= 0) return;
+
+    const kind = CAPTION_STYLES[cap.style] ? cap.style : "clean";
+    const base = Math.min(W, H);
+    const y = (cap.y == null ? 0.86 : cap.y) * H;
+    const maxW = W * 0.82;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    if (kind === "terminal") {
+      const size = base * 0.032;
+      ctx.font = `600 ${size}px ${CAPTION_MONO}`;
+      const lines = wrapText(ctx, cap.text, maxW);
+      const lh = size * 1.5;
+      const boxH = lines.length * lh + size * 0.7;
+      ctx.fillStyle = "rgba(6,10,8,0.88)";
+      roundRectPath(ctx, W * 0.09, y - boxH / 2, W * 0.82, boxH, size * 0.25);
+      ctx.fill();
+      ctx.fillStyle = "#4ade80";
+      lines.forEach((l, i) => ctx.fillText(l, W / 2, y - ((lines.length - 1) * lh) / 2 + i * lh));
+      ctx.restore();
+      return;
+    }
+
+    if (kind === "pop") {
+      const size = base * 0.048;
+      ctx.font = `800 ${size}px ${CAPTION_FONT}`;
+      const lines = wrapText(ctx, cap.text, maxW);
+      const lh = size * 1.34;
+      lines.forEach((l, i) => {
+        const ly = y - ((lines.length - 1) * lh) / 2 + i * lh;
+        const w = ctx.measureText(l).width;
+        ctx.fillStyle = "#0b0c0f";
+        roundRectPath(ctx, W / 2 - w / 2 - size * 0.42, ly - size * 0.66, w + size * 0.84, size * 1.32, size * 0.32);
+        ctx.fill();
+        ctx.fillStyle = "#fbbf24";
+        ctx.fillText(l, W / 2, ly);
+      });
+      ctx.restore();
+      return;
+    }
+
+    if (kind === "neon") {
+      const size = base * 0.05;
+      ctx.font = `800 ${size}px ${CAPTION_FONT}`;
+      const lines = wrapText(ctx, cap.text, maxW);
+      const lh = size * 1.3;
+      lines.forEach((l, i) => {
+        const ly = y - ((lines.length - 1) * lh) / 2 + i * lh;
+        ctx.shadowColor = "rgba(56,189,248,0.9)";
+        ctx.shadowBlur = size * 0.7;
+        ctx.fillStyle = "#e0f2fe";
+        // Two passes: the glow has to build up to read as light, not as blur.
+        ctx.fillText(l, W / 2, ly);
+        ctx.fillText(l, W / 2, ly);
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "#fff";
+        ctx.fillText(l, W / 2, ly);
+      });
+      ctx.restore();
+      return;
+    }
+
+    if (kind === "bold") {
+      const size = base * 0.058;
+      ctx.font = `800 ${size}px ${CAPTION_FONT}`;
+      const lines = wrapText(ctx, String(cap.text || "").toUpperCase(), maxW);
+      const lh = size * 1.22;
+      ctx.lineJoin = "round";
+      ctx.miterLimit = 2;
+      lines.forEach((l, i) => {
+        const ly = y - ((lines.length - 1) * lh) / 2 + i * lh;
+        ctx.lineWidth = size * 0.19;
+        ctx.strokeStyle = "#000";
+        ctx.strokeText(l, W / 2, ly);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(l, W / 2, ly);
+      });
+      ctx.restore();
+      return;
+    }
+
+    // clean — the default, and the one that should look like nothing was done.
+    const size = base * 0.038;
+    ctx.font = `600 ${size}px ${CAPTION_FONT}`;
+    const lines = wrapText(ctx, cap.text, maxW);
+    const lh = size * 1.42;
+    const boxH = lines.length * lh + size * 0.62;
+    let boxW = 0;
+    lines.forEach((l) => (boxW = Math.max(boxW, ctx.measureText(l).width)));
+    boxW += size * 1.5;
+    ctx.fillStyle = "rgba(8,9,12,0.66)";
+    roundRectPath(ctx, W / 2 - boxW / 2, y - boxH / 2, boxW, boxH, size * 0.42);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    lines.forEach((l, i) => ctx.fillText(l, W / 2, y - ((lines.length - 1) * lh) / 2 + i * lh));
     ctx.restore();
   }
 
@@ -1076,37 +1300,40 @@
 
     // The webcam sits OUTSIDE the camera transform: a picture-in-picture that
     // zoomed with the screen would be unwatchable.
-    if (cameraSrc && st.camera.show && cameraSrc.videoWidth !== 0) {
-      const d = Math.min(W, H) * st.camera.size;
-      const margin = Math.min(W, H) * 0.03;
-      const cxp = margin + (W - d - margin * 2) * st.camera.x;
-      const cyp = margin + (H - d - margin * 2) * st.camera.y;
+    const camReady = cameraSrc && (cameraSrc.videoWidth || cameraSrc.displayWidth);
+    if (camReady && st.camera.show) {
+      const L = cameraLayoutAt(opts.camShots, t, W, H, st);
       ctx.save();
-      ctx.shadowColor = "rgba(0,0,0,0.35)";
-      ctx.shadowBlur = d * 0.12;
-      ctx.shadowOffsetY = d * 0.04;
-      if (st.camera.shape === "circle") {
-        ctx.beginPath();
-        ctx.arc(cxp + d / 2, cyp + d / 2, d / 2, 0, Math.PI * 2);
-      } else {
-        roundRectPath(ctx, cxp, cyp, d, d * 0.66, d * 0.09);
+      // The shadow belongs to a floating inset, not to a full-frame shot.
+      if (L.k < 0.98) {
+        ctx.shadowColor = `rgba(0,0,0,${0.35 * (1 - L.k)})`;
+        ctx.shadowBlur = L.w * 0.12;
+        ctx.shadowOffsetY = L.w * 0.04;
       }
+      roundRectPath(ctx, L.x, L.y, L.w, L.h, L.radius);
       ctx.fillStyle = "#000";
       ctx.fill();
       ctx.shadowColor = "transparent";
       ctx.clip();
-      const vw = cameraSrc.videoWidth, vh = cameraSrc.videoHeight;
-      const boxH = st.camera.shape === "circle" ? d : d * 0.66;
-      const s = Math.max(d / vw, boxH / vh);
-      const w = vw * s, hgt = vh * s;
+      const vw = cameraSrc.videoWidth || cameraSrc.displayWidth;
+      const vh = cameraSrc.videoHeight || cameraSrc.displayHeight;
+      const sc = Math.max(L.w / vw, L.h / vh);
+      const w = vw * sc, hgt = vh * sc;
       if (st.camera.mirror) {
-        ctx.translate(cxp + d / 2, 0);
+        ctx.translate(L.x + L.w / 2, 0);
         ctx.scale(-1, 1);
-        ctx.translate(-(cxp + d / 2), 0);
+        ctx.translate(-(L.x + L.w / 2), 0);
       }
-      ctx.drawImage(cameraSrc, cxp + (d - w) / 2, cyp + (boxH - hgt) / 2, w, hgt);
+      ctx.drawImage(cameraSrc, L.x + (L.w - w) / 2, L.y + (L.h - hgt) / 2, w, hgt);
       ctx.restore();
     }
+
+    // Captions go last of all, over the webcam as well as the screen.
+    (opts.overlays || []).forEach((ov) => {
+      if (ov.type !== "caption" || !ov.text) return;
+      if (t < ov.start || t > ov.end) return;
+      drawCaption(ctx, W, H, ov, t);
+    });
   }
 
   /* ── WebM, read and written by hand ──────────────────────────────────────
@@ -1951,6 +2178,8 @@
             keys,
             track,
             cameraSrc: camSrc,
+            camShots: opts.camShots || [],
+            overlays: opts.overlays || [],
           });
           // A keyframe every two seconds keeps the file seekable without
           // paying for one on every frame.
@@ -2143,6 +2372,7 @@
         trim: { start: 0, end: rec.meta.durationMs },
         style: JSON.parse(JSON.stringify(STYLE_DEFAULTS)),
         segments: [],
+        camShots: [],
         overlays: [],
       },
       output: { width: Math.min(1920, rec.meta.width || 1920) },
@@ -2163,6 +2393,7 @@
         trim: e.trim || fresh.edit.trim,
         style: Object.assign({}, fresh.edit.style, e.style || {}),
         segments: Array.isArray(e.segments) ? e.segments : [],
+        camShots: Array.isArray(e.camShots) ? e.camShots : [],
         overlays: Array.isArray(e.overlays) ? e.overlays : [],
       },
       output: Object.assign({}, fresh.output, p.output || {}),
@@ -2357,10 +2588,20 @@
       color: #b8bbc2; border-radius: 7px; }
     .tbar button.tool:hover { background: #21242b; color: #fff; }
     .tbar .time { font-variant-numeric: tabular-nums; font-size: 11px; color: #85888f; }
-    .track { position: relative; height: 52px; background: #0e1014; border: 1px solid #1c1e25; border-radius: 7px;
+    .track { position: relative; height: 80px; background: #0e1014; border: 1px solid #1c1e25; border-radius: 7px;
       overflow: hidden; cursor: text; user-select: none; }
-    .track .zoomrow { position: absolute; left: 0; right: 0; top: 5px; height: 26px; }
-    .track .seg-block { position: absolute; top: 0; height: 26px; background: linear-gradient(180deg,#a855f7,#7c3aed);
+    .track .zoomrow { position: absolute; left: 0; right: 0; top: 4px; height: 22px; }
+    .track .camrow { position: absolute; left: 0; right: 0; top: 29px; height: 18px; }
+    .track .caprow { position: absolute; left: 0; right: 0; top: 50px; height: 18px; }
+    .track .cap-block { position: absolute; top: 0; height: 18px; background: linear-gradient(180deg,#f8fafc,#cbd5e1);
+      border-radius: 4px; display: flex; align-items: center; padding: 0 5px; font-size: 9px; font-weight: 700;
+      color: #0f172a; overflow: hidden; cursor: grab; white-space: nowrap; }
+    .track .cap-block .x { margin-left: auto; opacity: .6; font-size: 11px; padding: 0 1px; }
+    .track .cam-block { position: absolute; top: 0; height: 18px; background: linear-gradient(180deg,#22d3ee,#0891b2);
+      border-radius: 5px; display: flex; align-items: center; padding: 0 5px; font-size: 9px; font-weight: 700;
+      color: #04252c; overflow: hidden; cursor: grab; box-shadow: 0 2px 8px rgba(8,145,178,.4); }
+    .track .cam-block .x { margin-left: auto; opacity: .75; font-size: 11px; padding: 0 1px; }
+    .track .seg-block { position: absolute; top: 0; height: 22px; background: linear-gradient(180deg,#a855f7,#7c3aed);
       border-radius: 5px; display: flex; align-items: center; padding: 0 5px; font-size: 9.5px; font-weight: 700;
       color: #fff; overflow: hidden; cursor: grab; box-shadow: 0 2px 8px rgba(124,58,237,.4); }
     .track .seg-block.sel { outline: 1.5px solid #fbbf24; outline-offset: -1.5px; }
@@ -2769,7 +3010,8 @@
         let t = video.currentTime * 1000;
         // Playback stays inside the trim, so what plays is what renders.
         if (t > edit.trim.end) { video.pause(); video.currentTime = edit.trim.end / 1000; t = edit.trim.end; play.innerHTML = "▶"; }
-        renderFrame(ctx, { W: outW, H: outH, src: video, srcW, srcH, t, style, keys, track: rec.track, cameraSrc: camVideo });
+        renderFrame(ctx, { W: outW, H: outH, src: video, srcW, srcH, t, style, keys,
+          track: rec.track, cameraSrc: camVideo, camShots: edit.camShots, overlays: edit.overlays });
         playhead.style.left = pct(t);
         cur.textContent = formatDuration(t - edit.trim.start);
         raf = requestAnimationFrame(draw);
@@ -2781,6 +3023,8 @@
       const total = h("span", { class: "time" }, [formatDuration(edit.trim.end - edit.trim.start)]);
       const track = h("div", { class: "track" });
       const zoomrow = h("div", { class: "zoomrow" });
+      const camrow = h("div", { class: "camrow" });
+      const caprow = h("div", { class: "caprow" });
       const playhead = h("div", { class: "play" });
       const trimL = h("div", { class: "trim" });
       const trimR = h("div", { class: "trim" });
@@ -2882,6 +3126,99 @@
         );
       };
 
+      const paintCamShots = () => {
+        camrow.innerHTML = "";
+        (edit.camShots || []).forEach((sh, i) => {
+          const b = h("div", {
+            class: "cam-block",
+            style: `left:${pct(sh.start)};width:${((sh.end - sh.start) / dur) * 100}%`,
+            title: `Webcam full frame · ${formatDuration(sh.start)} → ${formatDuration(sh.end)}`,
+          }, [h("span", {}, ["FACE"]), h("span", { class: "x", title: "Remove", html: "&times;" })]);
+          b.querySelector(".x").addEventListener("click", (e) => {
+            e.stopPropagation();
+            edit.camShots.splice(i, 1);
+            paintCamShots();
+            touch();
+          });
+          b.addEventListener("pointerdown", (e) => {
+            if (e.target.classList.contains("x")) return;
+            e.stopPropagation();
+            const x0 = e.clientX, s0 = sh.start, e0 = sh.end, len = e0 - s0;
+            const move = (ev) => {
+              const d = ((ev.clientX - x0) / track.getBoundingClientRect().width) * dur;
+              sh.start = clamp(s0 + d, 0, dur - len);
+              sh.end = sh.start + len;
+              paintCamShots();
+              touch();
+            };
+            const up = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
+            addEventListener("pointermove", move);
+            addEventListener("pointerup", up);
+          });
+          camrow.appendChild(b);
+        });
+      };
+
+      const addCamShot = () => {
+        const t = video.currentTime * 1000;
+        edit.camShots.push({
+          id: uuid(),
+          start: t,
+          end: Math.min(dur, t + 6000),
+          inMs: CAMERA_SHOT_DEFAULTS.inMs,
+          outMs: CAMERA_SHOT_DEFAULTS.outMs,
+          mode: "full",
+        });
+        edit.camShots.sort((a, b) => a.start - b.start);
+        paintCamShots();
+        touch();
+      };
+
+      const captions = () => edit.overlays.filter((o) => o.type === "caption");
+
+      const paintCaptions = () => {
+        caprow.innerHTML = "";
+        captions().forEach((cap) => {
+          const b = h("div", {
+            class: "cap-block",
+            style: `left:${pct(cap.start)};width:${((cap.end - cap.start) / dur) * 100}%`,
+            title: cap.text,
+          }, [h("span", {}, [cap.text.slice(0, 24) || "…"]), h("span", { class: "x", title: "Remove", html: "&times;" })]);
+          b.querySelector(".x").addEventListener("click", (e) => {
+            e.stopPropagation();
+            edit.overlays.splice(edit.overlays.indexOf(cap), 1);
+            paintCaptions(); paintPane(); touch();
+          });
+          b.addEventListener("pointerdown", (e) => {
+            if (e.target.classList.contains("x")) return;
+            e.stopPropagation();
+            const x0 = e.clientX, s0 = cap.start, len = cap.end - cap.start;
+            const move = (ev) => {
+              const d = ((ev.clientX - x0) / track.getBoundingClientRect().width) * dur;
+              cap.start = clamp(s0 + d, 0, dur - len);
+              cap.end = cap.start + len;
+              paintCaptions(); touch();
+            };
+            const up = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
+            addEventListener("pointermove", move);
+            addEventListener("pointerup", up);
+          });
+          caprow.appendChild(b);
+        });
+      };
+
+      const addCaption = () => {
+        const t = video.currentTime * 1000;
+        edit.overlays.push({
+          id: uuid(), type: "caption", start: t, end: Math.min(dur, t + 2600),
+          text: "New caption", style: "clean", y: 0.86,
+        });
+        edit.overlays.sort((a, b) => a.start - b.start);
+        paintCaptions(); touch();
+        if (activeTab !== "Text") { activeTab = "Text"; [...tabs.children].forEach((c) => c.classList.toggle("on", c.textContent === "Text")); }
+        paintPane();
+      };
+
       const repaintMarks = () => {
         track.querySelectorAll(".clickmark,.keymark").forEach((n) => n.remove());
         (rec.track.clicks || []).filter((c) => c.kind === "down").forEach((c) =>
@@ -2916,6 +3253,8 @@
           edit.trim.end = Math.max(video.currentTime * 1000, edit.trim.start + 400);
           total.textContent = formatDuration(edit.trim.end - edit.trim.start); paintTrim(); touch();
         } }, ["End ⇥"]),
+        h("button", { class: "tool", title: "Fill the frame with the webcam here", onclick: () => addCamShot() }, ["+ Face"]),
+        h("button", { class: "tool", title: "Add a caption at the playhead", onclick: () => addCaption() }, ["+ Text"]),
         h("button", { class: "tool", title: "Re-plan every zoom from the clicks", onclick: () => {
           edit.segments = rec.meta.hasCursorTrack ? planZooms(rec.track, dur) : [];
           recompute();
@@ -2924,7 +3263,7 @@
 
       /* inspector */
       const pane = h("div", { class: "pane" });
-      const TABS = ["Look", "Zoom", "Cursor", "Camera"];
+      const TABS = ["Look", "Zoom", "Text", "Cursor", "Camera"];
       const tabs = h("div", { class: "tabs" });
       let activeTab = "Look";
 
@@ -2961,6 +3300,36 @@
           pane.appendChild(h("div", { class: "hint" }, [
             "Drag a block on the timeline to move a zoom, or use + Zoom to add one at the playhead.",
           ]));
+        } else if (activeTab === "Text") {
+          pane.appendChild(
+            h("button", { class: "tool", style: "width:100%;height:26px", onclick: addCaption }, ["+ Caption at playhead"])
+          );
+          const list = captions();
+          if (!list.length) {
+            pane.appendChild(h("div", { class: "hint" }, [
+              "Captions sit above everything, including a full-frame webcam, and never zoom with the picture.",
+            ]));
+          }
+          list.forEach((cap) => {
+            pane.appendChild(h("h4", {}, [formatDuration(cap.start) + " → " + formatDuration(cap.end)]));
+            const ta = h("textarea", {
+              rows: 2,
+              style: "width:100%;background:#15171c;border:1px solid #24262d;color:#e7e8ea;border-radius:7px;padding:6px 7px;font-size:11.5px;resize:vertical;font-family:inherit",
+            });
+            ta.value = cap.text;
+            ta.addEventListener("input", () => { cap.text = ta.value; paintCaptions(); touch(); });
+            pane.appendChild(ta);
+            const styles = h("div", { style: "display:flex;flex-wrap:wrap;gap:4px;margin-top:5px" });
+            Object.keys(CAPTION_STYLES).forEach((k) => {
+              const b = h("button", { class: "tool", title: CAPTION_STYLES[k].hint }, [CAPTION_STYLES[k].label]);
+              if (cap.style === k) { b.style.background = "#f59e0b"; b.style.color = "#16130a"; }
+              b.addEventListener("click", () => { cap.style = k; touch(); paintPane(); });
+              styles.appendChild(b);
+            });
+            pane.appendChild(styles);
+            pane.appendChild(slider("Height", 0.1, 0.94, 0.01, cap.y == null ? 0.86 : cap.y,
+              (v) => Math.round(v * 100) + "%", (v) => { cap.y = v; touch(); }));
+          });
         } else if (activeTab === "Cursor") {
           if (!rec.meta.hasCursorTrack) {
             pane.appendChild(h("div", { class: "empty" }, ["No pointer data — this was a window or screen recording, so the system cursor is already in the picture."]));
@@ -2981,6 +3350,16 @@
             pane.appendChild(slider("Size", 0.1, 0.4, 0.01, style.camera.size, (v) => Math.round(v * 100) + "%", (v) => { style.camera.size = v; touch(); }));
             pane.appendChild(slider("X", 0, 1, 0.01, style.camera.x, (v) => Math.round(v * 100) + "%", (v) => { style.camera.x = v; touch(); }));
             pane.appendChild(slider("Y", 0, 1, 0.01, style.camera.y, (v) => Math.round(v * 100) + "%", (v) => { style.camera.y = v; touch(); }));
+            pane.appendChild(h("h4", {}, ["Full-frame shots"]));
+            pane.appendChild(
+              h("button", { class: "tool", style: "width:100%;height:26px", onclick: addCamShot },
+                ["+ Fill the frame here"])
+            );
+            pane.appendChild(h("div", { class: "hint" }, [
+              rec.meta.cameraWidth
+                ? `Recorded at ${rec.meta.cameraWidth}×${rec.meta.cameraHeight}, so it holds up full frame. The corner inset grows into the whole picture and back — drag the cyan block to move it.`
+                : "The webcam grows from the corner inset into the whole picture and back. Drag the cyan block on the timeline to move it.",
+            ]));
             const shape = h("div", { class: "ctl" }, [h("span", {}, ["Shape"])]);
             ["circle", "rounded"].forEach((k) => {
               const b = h("button", { class: "tool" }, [k]);
@@ -3031,6 +3410,8 @@
             track: rec.track,
             style,
             segments: edit.segments,
+            camShots: edit.camShots,
+            overlays: edit.overlays,
             trim: edit.trim,
             width: project.output.width,
             shouldCancel: () => cancelling,
@@ -3090,6 +3471,8 @@
       ]);
 
       track.appendChild(zoomrow);
+      track.appendChild(camrow);
+      track.appendChild(caprow);
       track.appendChild(trimL); track.appendChild(trimR);
       track.appendChild(handleL); track.appendChild(handleR);
       track.appendChild(playhead);
@@ -3099,7 +3482,7 @@
       wrap.appendChild(bottom); wrap.appendChild(progress);
       ui.layer.appendChild(wrap);
 
-      paintPane(); repaintMarks(); paintTrack(); paintTrim();
+      paintPane(); repaintMarks(); paintTrack(); paintCamShots(); paintCaptions(); paintTrim();
       video.addEventListener("loadeddata", () => { seekTo(edit.trim.start); draw(); }, { once: true });
 
       // An agent editing the project from MCP lands here.
@@ -3113,8 +3496,10 @@
           Object.assign(style, project.edit.style);
           edit.trim = project.edit.trim;
           edit.segments = project.edit.segments;
+          edit.camShots = project.edit.camShots;
           keys = buildCameraTrack(edit.segments);
-          paintPane(); paintTrack(); paintTrim();
+          edit.overlays = project.edit.overlays;
+          paintPane(); paintTrack(); paintCamShots(); paintCaptions(); paintTrim();
           total.textContent = formatDuration(edit.trim.end - edit.trim.start);
         });
       };
@@ -3137,6 +3522,11 @@
     onCameraChange,
     classifyCamera,
     renderFrame,
+    cameraLayoutAt,
+    CAMERA_SHOT_DEFAULTS,
+    drawCaption,
+    CAPTION_STYLES,
+    wrapText,
     framedRect,
     paintBackground,
     drawCursor,
