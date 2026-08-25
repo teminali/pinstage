@@ -2681,8 +2681,11 @@
       transition: transform .15s; }
     .sw.on { background: #f59e0b; }
     .sw.on i { transform: translateX(15px); }
-    .pick { flex: none; background: #15171c; border: 1px solid #24262d; color: #d5d7dd; font-size: 11.5px;
-      font-weight: 600; border-radius: 7px; padding: 5px 7px; max-width: 190px; }
+    .pick { flex: none; background: #15171c; border: 1px solid #2e313a; color: #d5d7dd; font-size: 11.5px;
+      font-weight: 600; border-radius: 7px; padding: 6px 8px; max-width: 200px; cursor: pointer; position: relative;
+      z-index: 1; }
+    .pick:hover { border-color: #3d414c; background: #191c22; }
+    .pick:focus { outline: none; border-color: #f59e0b; }
     .cta { width: 100%; padding: 10px; background: #f59e0b; color: #16130a; font-weight: 800; font-size: 13px;
       border-radius: 10px; margin-top: 12px; }
     .cta.ghost { background: #191b21; color: #cdd0d6; font-weight: 600; margin-top: 7px; }
@@ -2840,7 +2843,11 @@
       h("div", { class: "lbl", html: label + (hint ? "<small>" + hint + "</small>" : "") }),
       sw,
     ]);
-    row.addEventListener("click", () => {
+    row.addEventListener("click", (e) => {
+      // A row can carry its own control — the camera picker lives in one. A
+      // click on that control is not a click on the switch, and letting it
+      // bubble here meant opening the dropdown turned the webcam off.
+      if (e.target.closest("select,input,button,textarea,a,option")) return;
       on = !on;
       sw.classList.toggle("on", on);
       onChange(on);
@@ -2852,7 +2859,8 @@
     const sw = h("div", { class: "sw" + (initial ? " on" : "") }, [h("i")]);
     let on = initial;
     const row = h("div", { class: "ctl tog" }, [h("span", {}, [label]), sw]);
-    row.addEventListener("click", () => {
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("select,input,button,textarea,a,option")) return;
       on = !on;
       sw.classList.toggle("on", on);
       onChange(on);
@@ -3747,7 +3755,27 @@
       ui.layer.appendChild(wrap);
 
       paintPane(); repaintMarks(); paintTrack(); paintCamShots(); paintCaptions(); paintTrim(); paintQuality();
-      video.addEventListener("loadeddata", () => { seekTo(edit.trim.start); draw(); }, { once: true });
+      video.addEventListener("loadeddata", () => {
+        seekTo(edit.trim.start);
+        draw();
+        // A still for the library row. Taken a beat after the in point, because
+        // the very first frame of a screen recording is usually the share
+        // picker still fading out.
+        if (!project.poster) {
+          setTimeout(() => {
+            try {
+              const th = document.createElement("canvas");
+              th.width = 160;
+              th.height = Math.round((160 * canvas.height) / canvas.width);
+              th.getContext("2d").drawImage(canvas, 0, 0, th.width, th.height);
+              project.poster = th.toDataURL("image/jpeg", 0.5);
+              touch();
+            } catch (e) {
+              /* a tainted canvas just means no thumbnail */
+            }
+          }, 700);
+        }
+      }, { once: true });
 
       // An agent editing the project from MCP lands here.
       const onExternal = (e) => {
