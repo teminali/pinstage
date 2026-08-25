@@ -1,14 +1,18 @@
 ---
 name: pinstage-studio
-description: Edit a Pinstage Studio screen recording — cut dead air, place zooms, write captions, cut to the webcam, set speed, and render with Remotion. Use whenever someone asks to edit, tighten, caption, trim, speed up, or render a screen recording, tutorial or bug repro made with Pinstage Studio, or mentions ~/Documents/pinstage/recordings.
+description: Edit a Pinstage Studio screen recording — cut dead air, place zooms, write captions, cut to the webcam, set speed, and render. Studio itself only records and produces; all editing happens in the folder, here. Use whenever someone asks to edit, tighten, caption, trim, speed up, or render a screen recording, tutorial or bug repro made with Pinstage Studio, or mentions ~/Documents/pinstage/recordings.
 ---
 
 # Editing a Pinstage Studio recording
 
-Studio records in the browser and writes each recording into a folder on this
-machine — `~/Documents/pinstage/recordings/<slug>/` unless `PINSTAGE_STUDIO_DIR`
-says otherwise. You edit the folder. Studio, if it is open, shows your changes
-within a few seconds.
+Studio records in the browser and produces the finished video there. It has no
+editor: pressing **Save everything to a folder** writes the recording and its
+edit into `~/Documents/pinstage/recordings/<slug>/` (or `PINSTAGE_STUDIO_DIR`),
+and that folder is where editing happens — by you, here.
+
+Nothing you write takes effect until it is rendered. Either re-open the
+recording in Studio and press **Produce** (it re-reads the folder first), or
+render it yourself with the Remotion project.
 
 ## The contract, and why it matters
 
@@ -54,6 +58,8 @@ decides what survives and in what order.
 `patch` validates before writing. A refusal names the clip and the reason —
 overlapping clips, a caption past the end, a zoom outside 1–4×. Read the
 refusal; do not retry the same shape.
+
+There is no live preview to check your work against. Render to see it.
 
 ## The edit
 
@@ -125,16 +131,19 @@ readable at any camera position. Use `clean` unless there is a reason not to.
 **4. Then the face.** A `camShots` entry where the person stops driving the UI
 and just talks. If they are demonstrating, leave the webcam in its corner.
 
-**5. Render.**
+**5. Render.** Either is fine:
 
 ```
-cd <pinstage>/remotion && node render.mjs <folder>
+cd <pinstage>/remotion && node render.mjs <folder>     # MP4, full toolkit
 ```
+
+or tell the user to press **Produce** in Studio, which re-reads the folder and
+renders WebM in the browser.
 
 ## Render in the browser, or with Remotion?
 
-Studio's own Export is faster and needs nothing installed. Use Remotion when you
-need something it cannot do:
+Studio's own Produce is faster and needs nothing installed. Use Remotion when
+you need something it cannot do:
 
 - **Audio on a sped-up clip.** The browser exporter copies Opus packets through
   untouched — which is what keeps narration bit-identical — but that also means
@@ -145,7 +154,7 @@ need something it cannot do:
   a soundtrack, a transition Remotion already has.
 
 The Remotion project imports `pinstage-studio.js` and calls the same
-`renderFrame` the browser preview uses, so the two renders cannot drift. Add to
+`renderFrame` Studio's own Produce uses, so the two renders cannot drift. Add to
 the composition; do not reimplement the camera or the cursor.
 
 ## Things that will bite you
