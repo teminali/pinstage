@@ -124,9 +124,38 @@
   };
 
   /* The URL this file was served from, read at PARSE time — once the script
-   * finishes evaluating, document.currentScript is null forever. */
+   * finishes evaluating, document.currentScript is null forever. Studio is
+   * fetched from beside it, so a CDN copy and a self-hosted copy both work with
+   * no configuration. */
   const SELF_URL = (document.currentScript && document.currentScript.src) || "";
   const VERSION = "0.6.0";
+  let STUDIO_URL = "";
+  let studioPromise = null;
+
+  /** Studio is ~90KB and almost nobody opens it, so it is never on the critical
+   *  path: it is fetched the first time someone actually clicks Record. */
+  function loadStudio() {
+    if (window.PinstageStudio) return Promise.resolve(window.PinstageStudio);
+    if (studioPromise) return studioPromise;
+    const url =
+      STUDIO_URL ||
+      (SELF_URL ? SELF_URL.replace(/[^/]*$/, "pinstage-studio.js") : "/toolbar/pinstage-studio.js");
+    studioPromise = new Promise((resolve, reject) => {
+      const el = document.createElement("script");
+      el.src = url;
+      el.async = true;
+      el.onload = () =>
+        window.PinstageStudio
+          ? resolve(window.PinstageStudio)
+          : reject(new Error("Studio loaded but did not register"));
+      el.onerror = () => {
+        studioPromise = null;
+        reject(new Error("Could not load Studio from " + url));
+      };
+      document.head.appendChild(el);
+    });
+    return studioPromise;
+  }
 
   const now = () => ({ _ts: clock.now() });
 
@@ -755,6 +784,9 @@
   /* ═══════════════════════════════════════════════════════════════════════ */
 
   function init(cfg) {
+    // Optional override for hosts that serve the two files from different
+    // places; by default Studio is found next to this script.
+    STUDIO_URL = (cfg && cfg.studioUrl) || "";
 
     // Say which build this is and where it came from.
     //
@@ -1055,6 +1087,13 @@
     const host = document.createElement("div");
     host.setAttribute("data-pinstage", "");
 
+    // Recording THIS tab captures the rendered page, and the rendered page
+    // includes us. A tutorial with the feedback toolbar sitting in the corner
+    // of every frame is not a tutorial anyone would ship, so the toolbar takes
+    // itself out of shot for the duration and comes back afterwards.
+    addEventListener("pinstage:recording", (e) => {
+      host.style.display = e.detail && e.detail.active ? "none" : "";
+    });
     Object.assign(host.style, { position: "fixed", inset: "0", zIndex: String(cfg.zIndex || 2147483000), pointerEvents: "none" });
     const root = host.attachShadow({ mode: "open" });
 
@@ -1774,6 +1813,26 @@
         });
         row.appendChild(shot);
 
+        const vid = document.createElement("button");
+        vid.className = "iconbtn";
+        vid.innerHTML = svg("video");
+        vid.title = "Record a video of the problem — clicks become zooms";
+        vid.addEventListener("click", async () => {
+          vid.disabled = true;
+          try {
+            const Studio = await loadStudio();
+            Studio.open({
+              // The finished file comes straight back as an attachment, so a
+              // repro never has to leave the browser to be shared.
+              onAttach: async (fileBlob) => addAttachment(fileBlob),
+            });
+          } catch (e) {
+            vid.title = String((e && e.message) || e);
+          } finally {
+            vid.disabled = false;
+          }
+        });
+        row.appendChild(vid);
 
         const file = document.createElement("input");
         file.type = "file";
@@ -2609,6 +2668,18 @@
       comment.addEventListener("click", () => setMode(state.mode === "comment" ? "idle" : "comment"));
       bar.appendChild(comment);
 
+      const record = document.createElement("button");
+      record.innerHTML = svg("video", 14) + "<span>Record</span>";
+      record.title = "Record a tutorial — screen, voice and webcam, with click-driven zoom";
+      record.addEventListener("click", async () => {
+        try {
+          (await loadStudio()).open({});
+        } catch (e) {
+          record.innerHTML = svg("video", 14) + "<span>Unavailable</span>";
+          record.title = String((e && e.message) || e);
+        }
+      });
+      bar.appendChild(record);
 
       const allActive = state.allActiveThreads || state.threads;
       const hasWorking = allActive.some((t) => t.data?.status === "in_progress" || t.data?.status === "deploying");
